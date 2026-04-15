@@ -1,111 +1,114 @@
 # Lentel
 
-**A new file-transfer protocol for moving any file, of any size, between
-any two hosts on the Internet — with no port forwarding.**
+**Send any file, any size, to anyone — no server, no port forwarding.**
 
-Lentel is a from-scratch protocol and reference implementation. It does not
-sit on top of QUIC, WebRTC, libp2p, BitTorrent, rsync, KCP, Magic-Wormhole,
-or any other existing transfer system. The wire format, handshake,
-reliability layer, congestion controller, NAT-traversal, and application
-framing live in this repository.
+[![CI](https://github.com/MridulHarsh/lentel/actions/workflows/ci.yml/badge.svg)](https://github.com/MridulHarsh/lentel/actions/workflows/ci.yml)
+[![Release](https://github.com/MridulHarsh/lentel/actions/workflows/release.yml/badge.svg)](https://github.com/MridulHarsh/lentel/releases/latest)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
+[![License](https://img.shields.io/badge/license-Apache%202.0-green.svg)](LICENSE)
 
-The full wire specification is in [PROTOCOL.md](PROTOCOL.md).
+Lentel is a from-scratch file transfer protocol and application. No existing
+protocol is used — the wire format, handshake, reliability layer, congestion
+controller, NAT traversal, and application framing are all new. The only
+runtime dependency is `cryptography` for AEAD and key-exchange primitives.
 
-## Why it's fast
+**No server of any kind is required.** The sender's public address is
+discovered automatically via STUN/UPnP and embedded in the ticket. The
+receiver connects directly.
 
-- **BBR-inspired congestion control.** Loss-tolerant: Lentel keeps probing
-  bandwidth instead of halving on every dropped packet, so transient drops
-  on a congested hop don't collapse throughput.
-- **Parallel multiplexed streams.** Four streams by default, sharing a
-  single UDP socket and a single cipher state, so the aggregate pacer can
-  saturate the path.
-- **Custom reliability.** Selective ACKs with explicit NACKs and timer-based
-  retransmits. No kernel TCP stack, no head-of-line blocking across streams.
-- **Zero-copy-friendly chunks.** 64 KiB chunks, hashed with BLAKE2b and
-  verified on receive, write directly to disk — the receiver never buffers
-  the whole file.
-- **Resumable.** If the link breaks, the receiver's already-verified chunks
-  are replayed on reconnect and the sender skips them.
+## Download
 
-## Why you don't need port forwarding
+| Platform | Download | Notes |
+|----------|----------|-------|
+| **macOS** | [Lentel-macOS.dmg](https://github.com/MridulHarsh/lentel/releases/latest/download/Lentel-macOS.dmg) | Open DMG, drag to Applications. Menu-bar app (no dock icon). |
+| **Windows** | [Lentel.exe](https://github.com/MridulHarsh/lentel/releases/latest/download/Lentel.exe) | Single file. Run it — appears in the system tray. |
+| **Any OS (pip)** | `pip install lentel` | CLI + Python API. Add `[tray]` for the GUI. |
 
-Lentel ships with a tiny rendezvous **coordinator** (~200 lines of Python).
-Both peers make an *outbound* TCP connection to the coordinator. The
-coordinator observes each peer's reflexive UDP address and tells them to
-begin UDP hole-punching simultaneously. Most home and mobile NATs will
-accept an inbound datagram on a mapping that was just used outbound — so a
-direct peer-to-peer UDP path comes up without either user touching a router.
-
-For the small fraction of symmetric-NAT pairs where hole punching fails,
-the coordinator issues a relay token and the same Lentel session runs
-end-to-end through a **relay** (also shipped in this repo). The relay
-cannot decrypt anything — it only forwards datagrams.
-
-## Architecture
+## How it works
 
 ```
- Sender                 Coordinator                 Receiver
-  ───┐                  ┌────────────┐                ┌───
-     │── register(tkt) ─▶            ◀── redeem(tkt) ─│
-     │                  │  matches    │                │
-     │◀─ peer addr ─────│ + punch-at  │──── peer addr ─▶
-     │                  └────────────┘                │
-     │                                                │
-     │═════════════ UDP hole punch ═════════════════▶ │
-     │◀════════════ UDP hole punch ════════════════════│
-     │                                                │
-     │ ╔══════════════════════════════════════════╗  │
-     │ ║  Lentel session: handshake, N streams,   ║  │
-     │ ║  AEAD, BBR-lite, SACK/NACK, Merkle check ║  │
-     │ ╚══════════════════════════════════════════╝  │
+ Sender                                              Receiver
+   │                                                     │
+   │  1. Discovers own public IP:port                    │
+   │     via free STUN servers (Google, Cloudflare)      │
+   │     + optional UPnP port mapping                    │
+   │                                                     │
+   │  2. Generates ticket:                               │
+   │     bold-crab-fern-42@203.0.113.5:54321             │
+   │                   ─────────────────────▶            │
+   │     (share via chat, email, phone, etc.)            │
+   │                                                     │
+   │                                       3. Parses IP  │
+   │                                          from ticket│
+   │                                                     │
+   │  ◀════════════ direct UDP connection ══════════════▶ │
+   │                                                     │
+   │  4. X25519 + ChaCha20-Poly1305 handshake            │
+   │  5. Parallel encrypted transfer (4 streams)         │
+   │  6. BLAKE2b Merkle verification                     │
+   │                                                     │
+   ✓  Done — no server touched any of your data          ✓
 ```
 
-## Install
+**No coordinator, no relay, no account, no signup.** The ticket IS the
+connection string.
 
-The reference implementation is pure Python 3.11+ and depends only on the
-`cryptography` library for the AEAD and KEX primitives:
+## Desktop app
 
-```
-pip install -e .
-```
-
-## Quick start
-
-Run a coordinator somewhere with a public IP (a cheap $5 VPS is plenty —
-the coordinator pushes negligible traffic):
+The tray app runs in your **macOS menu bar** or **Windows system tray**:
 
 ```
-lentel-coordinator --bind 0.0.0.0:7777
+  ↑ Send a file…          ← pick a file, get a ticket
+  ↓ Receive a file…       ← paste a ticket, get the file
+  ──────────────────
+  Active transfers ▸
+    ↑ video.mkv  72%  45.2 MB/s
+  Clear finished
+  ──────────────────
+  Copy last ticket
+  Open downloads folder
+  ──────────────────
+  Settings ▸
+    Downloads folder…
+    Parallel streams: 4
+  ──────────────────
+  About
+  Quit
 ```
 
-Send a file. You get a ticket; share it with the receiver however you like:
+The icon lights up blue when a transfer is active.
 
+## CLI
+
+```bash
+pip install lentel
 ```
-$ lentel send --coordinator wss://coord.example.com:7777 ./video.mkv
-ticket: swift-otter-41
+
+**Send:**
+```
+$ lentel send ./video.mkv
+  Discovering public address…
+  Public address: 203.0.113.5:54321 (stun)
+
+ticket: bold-crab-fern-42@203.0.113.5:54321
+share it with the receiver.
 waiting for peer...
+
+ [####################----------] 65.0%  421.3 MB/612.0 MB  52.7 MB/s  eta 3s
 ```
 
-Receive it:
-
+**Receive:**
 ```
-$ lentel recv --coordinator wss://coord.example.com:7777 swift-otter-41
-receiving video.mkv (8.4 GiB)
- ███████████████████████████████  100%  612 MB/s  eta 0s
-verified. written to ./video.mkv
-```
+$ lentel recv bold-crab-fern-42@203.0.113.5:54321
+  Connecting to sender…
+  Connected — handshaking…
+  Receiving…
 
-If no `--coordinator` is given, the client uses the default public one
-specified in `~/.lentel/config.toml`, or the environment variable
-`LENTEL_COORDINATOR`.
-
-## Running your own relay (optional)
-
-```
-lentel-relay --bind 0.0.0.0:7778 --coordinator https://coord.example.com:7777
+ [##############################] 100.0%  612.0 MB/612.0 MB  48.1 MB/s  eta 0s
+saved to ./video.mkv
 ```
 
-The coordinator will advertise the relay automatically.
+That's it. No flags, no config, no server URL.
 
 ## Python API
 
@@ -113,55 +116,136 @@ The coordinator will advertise the relay automatically.
 import asyncio
 from lentel import send_file, recv_file
 
-async def main():
-    ticket = await send_file("./video.mkv", coordinator="wss://coord.example.com:7777")
-    print("ticket:", ticket)
+# Sender
+async def send():
+    ticket = await send_file(
+        "./video.mkv",
+        on_ticket=lambda t: print(f"ticket: {t}"),
+    )
 
-asyncio.run(main())
+# Receiver (on another machine)
+async def receive():
+    path = await recv_file(
+        "bold-crab-fern-42@203.0.113.5:54321",
+        dest_dir="./downloads",
+    )
+    print(f"saved to {path}")
+
+asyncio.run(send())   # or receive()
 ```
 
-```python
-import asyncio
-from lentel import recv_file
+## Why it's fast
 
-async def main():
-    path = await recv_file("swift-otter-41", dest_dir="./downloads",
-                           coordinator="wss://coord.example.com:7777")
-    print("saved to", path)
+| Feature | What it does |
+|---------|-------------|
+| **BBR-inspired congestion** | Loss-tolerant — keeps probing bandwidth instead of halving on every drop |
+| **4 parallel streams** | Shares one UDP socket + one cipher state; no head-of-line blocking |
+| **Selective ACK + NACK** | Fast retransmit at 1.5x SRTT; explicit retransmit requests for integrity failures |
+| **64 KiB chunks** | Hashed with BLAKE2b, verified on receive, written directly to disk |
+| **Resumable** | Reconnect and the sender skips already-verified chunks |
 
-asyncio.run(main())
-```
+## Why you don't need port forwarding
 
-## Layout
+Lentel discovers the sender's reachable address automatically:
+
+1. **UPnP (tried first)** — asks your router to open a port via IGD SOAP.
+   Works on most home routers. If it succeeds, you're reachable from anywhere.
+
+2. **STUN (fallback)** — queries free public STUN servers (`stun.l.google.com`,
+   `stun.cloudflare.com`) to learn your NAT's external IP:port. The sender
+   keeps the mapping alive with periodic keepalives. Works with cone-type NATs
+   (~75%+ of consumer routers).
+
+The discovered address is embedded in the ticket. The receiver connects
+directly — no middleman.
+
+## Security
+
+| Layer | Primitive |
+|-------|-----------|
+| Key exchange | X25519 ephemeral + ticket PSK |
+| Encryption | ChaCha20-Poly1305 AEAD (every packet) |
+| Integrity | BLAKE2b Merkle tree over 64 KiB chunks |
+| Authentication | 3-message Noise-style handshake (ticket = pre-shared key) |
+| Nonces | Deterministic from (direction, stream, sequence) — never reused |
+
+- The ticket's word code is hashed into a 32-byte PSK. Without it, an
+  attacker cannot complete the handshake or decrypt any packet.
+- A passive eavesdropper cannot see the file name, size, or contents.
+- Tickets are single-use and ephemeral — a new one is generated per transfer.
+
+Full wire specification: [PROTOCOL.md](PROTOCOL.md)
+
+## Project layout
 
 ```
 lentel/
-├── PROTOCOL.md            # Wire specification
-├── README.md              # You are here
-├── pyproject.toml
-├── lentel/
-│   ├── __init__.py        # public API
-│   ├── wire.py            # packet framing & types
-│   ├── crypto.py          # handshake + AEAD
-│   ├── congestion.py      # BBR-lite controller
-│   ├── transport.py       # reliable UDP + streams
-│   ├── nat.py             # hole punching + relay switch
-│   ├── chunker.py         # file → chunks + Merkle
-│   ├── session.py         # send/recv session state machines
-│   ├── rendezvous.py      # client protocol for coordinator
-│   ├── wordlist.py        # ticket wordlist
-│   ├── cli.py             # lentel send / lentel recv
-│   └── server/
-│       ├── coordinator.py # public rendezvous server
-│       └── relay.py       # symmetric-NAT fallback
-├── examples/
-│   ├── send.py
-│   └── recv.py
-└── tests/
-    └── test_wire.py
+├── wire.py            # Packet framing (20-byte header, type codes)
+├── crypto.py          # X25519 handshake + ChaCha20-Poly1305 AEAD
+├── congestion.py      # BBR-lite controller (STARTUP/DRAIN/PROBE_BW/PROBE_RTT)
+├── transport.py       # Reliable UDP: SACK, NACK, pacing, parallel streams
+├── nat.py             # STUN client (RFC 5389) + UPnP IGD port mapping
+├── chunker.py         # File → 64 KiB chunks + BLAKE2b Merkle tree
+├── session.py         # Send/recv state machines + resume
+├── rendezvous.py      # Orchestrates: discover → ticket → punch → transfer
+├── wordlist.py        # Ticket encoding (words + checksum + @IP:PORT)
+├── cli.py             # `lentel send` / `lentel recv`
+├── app/               # macOS menu-bar / Windows system-tray GUI
+│   ├── tray.py        #   pystray Icon + dynamic Menu
+│   ├── dialogs.py     #   osascript (macOS) / tkinter (Windows) prompts
+│   ├── state.py       #   Thread-safe transfer registry + config
+│   ├── runner.py      #   Asyncio event loop on worker thread
+│   └── icon.py        #   Procedurally drawn tray icon
+└── server/            # (Optional) coordinator + relay for legacy/fallback
 ```
 
-## Status
+## Building from source
 
-Reference implementation of v1 of the protocol. The wire format is
-frozen for the v1 line; future changes will bump `VER` in the header.
+**macOS:**
+```bash
+cd packaging/macos && ./build.sh
+open dist/Lentel.app
+```
+
+**Windows:**
+```powershell
+cd packaging\windows
+.\build.ps1
+.\dist\Lentel.exe
+```
+
+**From pip (any OS):**
+```bash
+pip install 'lentel[tray]'
+python -m lentel.app
+```
+
+Builds are automated — every version tag pushed to GitHub triggers a
+[GitHub Actions workflow](.github/workflows/release.yml) that builds both
+platforms and publishes them as release assets.
+
+## Running tests
+
+```bash
+pip install -e . && pip install pytest
+python -m pytest tests/ -v
+```
+
+24 tests: 20 unit (wire, crypto, chunker, congestion, wordlist, STUN) +
+4 end-to-end (loopback transfers through the full pipeline).
+
+## How to release a new version
+
+```bash
+# Bump version in pyproject.toml and lentel/__init__.py, then:
+git add -A && git commit -m "v1.1.0"
+git tag v1.1.0
+git push origin main v1.1.0
+```
+
+GitHub Actions will automatically build `Lentel-macOS.dmg` + `Lentel.exe`
+and publish them as a [GitHub Release](https://github.com/MridulHarsh/lentel/releases).
+
+## License
+
+Apache 2.0
