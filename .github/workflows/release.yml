@@ -1,0 +1,223 @@
+name: Build & Release
+
+# Triggers:
+#   1. Push a version tag  →  build both platforms + create GitHub Release
+#   2. Manual dispatch      →  same (for testing without tagging)
+on:
+  push:
+    tags:
+      - "v*"          # e.g. v1.0.0, v1.2.3-beta
+  workflow_dispatch:   # manual trigger from Actions tab
+
+permissions:
+  contents: write      # needed to create releases + upload assets
+
+jobs:
+  # ─────────────────────────────── Tests ──────────────────────────────────
+  test:
+    name: Run tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install cryptography>=41.0 pytest
+      - run: pip install -e .
+      - run: python -m pytest tests/test_wire.py -v
+
+  # ───────────────────────────── macOS build ──────────────────────────────
+  build-macos:
+    name: macOS (.app → .dmg)
+    needs: test
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -e ".[tray]"
+          pip install pyinstaller
+
+      - name: Build Lentel.app
+        run: |
+          python -m PyInstaller \
+            --name Lentel \
+            --windowed \
+            --noconfirm \
+            --clean \
+            --hidden-import lentel \
+            --hidden-import lentel.app.tray \
+            --hidden-import lentel.app.state \
+            --hidden-import lentel.app.runner \
+            --hidden-import lentel.app.icon \
+            --hidden-import lentel.app.dialogs \
+            --hidden-import lentel.wire \
+            --hidden-import lentel.crypto \
+            --hidden-import lentel.chunker \
+            --hidden-import lentel.congestion \
+            --hidden-import lentel.transport \
+            --hidden-import lentel.nat \
+            --hidden-import lentel.session \
+            --hidden-import lentel.rendezvous \
+            --hidden-import lentel.wordlist \
+            --hidden-import pystray._darwin \
+            --hidden-import PIL._tkinter_finder \
+            --collect-submodules lentel \
+            --collect-submodules pystray \
+            --exclude-module numpy \
+            --exclude-module pandas \
+            --exclude-module matplotlib \
+            --exclude-module scipy \
+            --exclude-module pytest \
+            --exclude-module lentel.server \
+            --osx-bundle-identifier com.lentel.app \
+            lentel/app/__main__.py
+
+      - name: Patch Info.plist (menu-bar only)
+        run: |
+          PLIST="dist/Lentel.app/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Add :LSUIElement bool true"  "$PLIST" 2>/dev/null || \
+          /usr/libexec/PlistBuddy -c "Set :LSUIElement true"       "$PLIST"
+          /usr/libexec/PlistBuddy -c "Add :NSHighResolutionCapable bool true" "$PLIST" 2>/dev/null || true
+
+      - name: Create DMG
+        run: |
+          # Create a drag-to-install DMG with Applications shortcut
+          mkdir -p dmg-staging
+          cp -R dist/Lentel.app dmg-staging/
+          ln -s /Applications dmg-staging/Applications
+          hdiutil create -volname "Lentel" \
+            -srcfolder dmg-staging \
+            -ov -format UDZO \
+            "Lentel-macOS.dmg"
+          ls -lh Lentel-macOS.dmg
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Lentel-macOS
+          path: Lentel-macOS.dmg
+
+  # ──────────────────────────── Windows build ─────────────────────────────
+  build-windows:
+    name: Windows (.exe)
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -e ".[tray]"
+          pip install pyinstaller
+
+      - name: Build Lentel.exe
+        run: |
+          python -m PyInstaller `
+            --name Lentel `
+            --onefile `
+            --noconsole `
+            --noconfirm `
+            --clean `
+            --hidden-import lentel `
+            --hidden-import lentel.app.tray `
+            --hidden-import lentel.app.state `
+            --hidden-import lentel.app.runner `
+            --hidden-import lentel.app.icon `
+            --hidden-import lentel.app.dialogs `
+            --hidden-import lentel.wire `
+            --hidden-import lentel.crypto `
+            --hidden-import lentel.chunker `
+            --hidden-import lentel.congestion `
+            --hidden-import lentel.transport `
+            --hidden-import lentel.nat `
+            --hidden-import lentel.session `
+            --hidden-import lentel.rendezvous `
+            --hidden-import lentel.wordlist `
+            --hidden-import pystray._win32 `
+            --hidden-import PIL._tkinter_finder `
+            --collect-submodules lentel `
+            --collect-submodules pystray `
+            --exclude-module numpy `
+            --exclude-module pandas `
+            --exclude-module matplotlib `
+            --exclude-module scipy `
+            --exclude-module pytest `
+            --exclude-module lentel.server `
+            lentel/app/__main__.py
+
+      - name: Verify exe exists
+        run: |
+          dir dist\Lentel.exe
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Lentel-Windows
+          path: dist/Lentel.exe
+
+  # ─────────────────────────── GitHub Release ─────────────────────────────
+  release:
+    name: Create GitHub Release
+    needs: [build-macos, build-windows]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download macOS artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: Lentel-macOS
+          path: artifacts/
+
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: Lentel-Windows
+          path: artifacts/
+
+      - name: List artifacts
+        run: ls -lhR artifacts/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "Lentel ${{ github.ref_name }}"
+          body: |
+            ## Lentel ${{ github.ref_name }}
+
+            Send any file, any size, to anyone — **no server, no port forwarding**.
+
+            ### Downloads
+
+            | Platform | File | Notes |
+            |----------|------|-------|
+            | **macOS** | `Lentel-macOS.dmg` | Open DMG → drag Lentel to Applications |
+            | **Windows** | `Lentel.exe` | Single file, run directly or add to Startup |
+
+            ### How it works
+
+            1. **Sender** clicks "Send a file" → picks a file → gets a ticket like `bold-crab-fern-42@203.0.113.5:54321`
+            2. **Receiver** clicks "Receive a file" → pastes the ticket → file transfers directly, peer-to-peer
+            3. No server. No account. No port forwarding. The sender's address is discovered automatically via STUN/UPnP.
+
+            ### What's new
+
+            See [CHANGELOG](https://github.com/${{ github.repository }}/commits/${{ github.ref_name }}) for details.
+          draft: false
+          prerelease: ${{ contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}
+          files: |
+            artifacts/Lentel-macOS.dmg
+            artifacts/Lentel.exe
