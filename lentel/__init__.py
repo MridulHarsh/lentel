@@ -1,21 +1,20 @@
 """
-Lentel — a new UDP-based protocol for moving files and folders of any size
-between any two hosts, without port forwarding and without any server.
+Lentel — send any file or folder to anyone, no server, no port forwarding.
+
+Receiver-first: the recipient opens a session, generates a ticket, and
+shares it.  The sender uses that ticket to push a file or folder.
 
 Public API:
-    from lentel import send_file, send_folder, recv_file
-
-``send_file`` and ``send_folder`` are aliases — both accept either a file
-path or a directory path.  ``recv_file`` likewise handles both automatically.
+    from lentel import recv_file, send_file
 """
 from __future__ import annotations
 
-__version__ = "1.0.4"
+__version__ = "1.0.5"
 __all__ = [
     "__version__",
+    "recv_file",
     "send_file",
     "send_folder",
-    "recv_file",
 ]
 
 from .rendezvous import recv_file, send_file, send_folder

@@ -1,15 +1,16 @@
 """
-Menu-bar / system-tray UI — coordinator-free edition.
+Menu-bar / system-tray UI — receiver-first edition.
 
-The tray app wraps the Lentel protocol which now works purely peer-to-peer:
-the sender discovers its own public address via STUN/UPnP, embeds it in the
-ticket, and the receiver connects directly. No server of any kind is needed.
+Flow:
+  * **Receive a file / folder**: the user clicks this to open a receive
+    session.  The app discovers their public address via STUN/UPnP, shows
+    a ticket dialog ("give this to the sender"), and waits for a sender.
+  * **Send**: the user clicks this, pastes a ticket they were given, then
+    picks a file or folder, and the transfer begins.
 
-**Threading model**:
-  - pystray owns the main thread.
-  - Every callback that shows a dialog runs in a worker thread (``_bg()``).
-  - On macOS, dialogs use osascript to avoid AppKit conflicts.
-  - File transfers run on a dedicated asyncio event loop thread (``runner.py``).
+Threading: pystray runs on the main thread; every callback that shows a
+dialog is dispatched to a short-lived worker thread via ``_bg()``; file
+transfers run on a background asyncio loop (``runner.py``).
 """
 from __future__ import annotations
 
@@ -23,13 +24,13 @@ try:
     from pystray import Icon, Menu, MenuItem
 except Exception as e:  # pragma: no cover
     raise RuntimeError(
-        "The Lentel tray app requires `pystray` and `Pillow`. Install them "
-        "with:  pip install 'lentel[tray]'"
+        "The Lentel tray app requires `pystray` and `Pillow`. "
+        "Install them with:  pip install 'lentel[tray]'"
     ) from e
 
 from lentel import recv_file, send_file
 from lentel.app.dialogs import (
-    ask_parallel, ask_relay, ask_ticket, copy_to_clipboard, error, info,
+    ask_parallel, ask_ticket, copy_to_clipboard, error, info,
     pick_directory, pick_file, reveal_in_file_manager,
 )
 from lentel.app.icon import make_icon
@@ -47,13 +48,12 @@ def _humanbytes(n: float) -> str:
 
 
 def _path_total_size(path: str) -> int:
-    """Sum all file sizes at or under ``path``. Folders are walked recursively."""
     if os.path.isfile(path):
         return os.path.getsize(path)
     total = 0
-    for dirpath, _, filenames in os.walk(path, followlinks=False):
-        for fname in filenames:
-            fp = os.path.join(dirpath, fname)
+    for dp, _, fnames in os.walk(path, followlinks=False):
+        for f in fnames:
+            fp = os.path.join(dp, f)
             try:
                 if os.path.isfile(fp) and not os.path.islink(fp):
                     total += os.path.getsize(fp)
@@ -69,9 +69,10 @@ def _fmt_transfer(t: Transfer) -> str:
         return f"{arrow} {t.file_name}  \u2717 error"
     if st == "done":
         return f"{arrow} {t.file_name}  \u2713 done"
-    if "waiting" in st:
-        return f"{arrow} {t.file_name}  waiting for receiver\u2026"
-    if "discovering" in st.lower() or "connecting" in st.lower():
+    if "waiting" in st or "listening" in st.lower():
+        return f"{arrow} {t.file_name}  {st}"
+    if "discovering" in st.lower() or "connecting" in st.lower() \
+            or "resolving" in st.lower() or "handshaking" in st.lower():
         return f"{arrow} {t.file_name}  {st}"
     if t.size > 0 and t.bytes_done > 0:
         pct = 100 * t.bytes_done / t.size
@@ -122,9 +123,10 @@ class TrayApp:
 
     def _build_menu(self) -> Menu:
         items: list[MenuItem] = [
+            MenuItem("Receive a file or folder\u2026", self._bg(self._on_receive)),
+            Menu.SEPARATOR,
             MenuItem("Send a file\u2026",    self._bg(self._on_send_file)),
             MenuItem("Send a folder\u2026",  self._bg(self._on_send_folder)),
-            MenuItem("Receive\u2026",        self._bg(self._on_recv)),
             Menu.SEPARATOR,
         ]
 
@@ -136,7 +138,7 @@ class TrayApp:
 
         if self.state.last_ticket:
             items.append(MenuItem(
-                f"Copy last ticket",
+                "Copy last ticket",
                 self._on_copy_last_ticket,
             ))
 
@@ -163,126 +165,42 @@ class TrayApp:
         return Menu(*items)
 
     def _settings_menu(self) -> Menu:
-        relay = self.state.config.relay_url
-        relay_label = f"Relay: {relay}" if relay else "Relay: (direct P2P)"
         return Menu(
             MenuItem("Downloads folder\u2026", self._bg(self._on_set_download_dir)),
             MenuItem(
                 f"Parallel streams: {self.state.config.parallel}",
                 self._bg(self._on_set_parallel),
             ),
-            MenuItem(relay_label, self._bg(self._on_set_relay)),
-        )
-
-    # ---- send flow -------------------------------------------------------
-    #
-    # 1. _on_send (worker thread):
-    #      pick file → submit async task (which discovers address, builds
-    #      ticket, shows dialog, waits for receiver, transfers)
-    #
-    # 2. _run_send (asyncio thread):
-    #      STUN/UPnP → ticket → on_ticket callback → show dialog in thread →
-    #      wait for peer → handshake → transfer → done/error
-    #
-
-    def _on_send_file(self, icon, item) -> None:
-        path = pick_file("Send a file with Lentel")
-        if not path:
-            return
-        self._start_send(path)
-
-    def _on_send_folder(self, icon, item) -> None:
-        path = pick_directory("Send a folder with Lentel")
-        if not path:
-            return
-        self._start_send(path)
-
-    def _start_send(self, path: str) -> None:
-        name = os.path.basename(path.rstrip(os.sep)) or path
-        size = _path_total_size(path)
-
-        transfer = self.state.new_transfer("send", name)
-        self.state.update(transfer, size=size, status="discovering address\u2026")
-        self._refresh()
-
-        self.runner.submit(self._run_send(transfer, path))
-
-    async def _run_send(self, transfer: Transfer, path: str) -> None:
-        started_transferring = [False]
-
-        def on_ticket(ticket: str) -> None:
-            self.state.update(transfer, ticket=ticket, status="waiting for receiver")
-            self.state.remember_ticket(ticket)
-            self._refresh()
-            # Show the ticket in a dialog (runs in a thread so we don't
-            # block the asyncio loop while the user reads it).
-            threading.Thread(target=self._show_ticket_dialog,
-                             args=(transfer.file_name, transfer.size, ticket),
-                             daemon=True).start()
-
-        def on_status(msg: str) -> None:
-            self.state.update(transfer, status=msg)
-            self._refresh()
-
-        def progress(done: int, total: int, rate: float) -> None:
-            if not started_transferring[0]:
-                started_transferring[0] = True
-                self.state.update(transfer, status="transferring")
-            self.state.update(transfer, bytes_done=done, rate_bps=rate)
-            if total > 0:
-                pct = 100 * done / total
-                if int(pct) % 2 == 0:
-                    self._refresh()
-
-        try:
-            await send_file(
-                path,
-                parallel=self.state.config.parallel,
-                progress=progress,
-                on_ticket=on_ticket,
-                on_status=on_status,
-                relay=self.state.config.relay_url or None,
-            )
-            self.state.update(transfer, status="done",
-                              bytes_done=transfer.size or 0)
-            self._notify("Sent", transfer.file_name)
-            self._refresh()
-
-        except Exception as e:
-            self._friendly_error(transfer, "send", e)
-
-    def _show_ticket_dialog(self, file_name: str, size: int, ticket: str) -> None:
-        copy_to_clipboard(ticket)
-        info(
-            "Lentel \u2014 Ticket Ready",
-            f"File:   {file_name} ({_humanbytes(size)})\n"
-            f"Ticket: {ticket}\n\n"
-            "Copied to clipboard. Share it with the receiver.\n"
-            "The transfer starts automatically when they connect.",
         )
 
     # ---- receive flow ----------------------------------------------------
+    #
+    # 1. _on_receive (worker thread via _bg):
+    #      submit async task → async task opens the socket and does STUN
+    #
+    # 2. _run_recv (asyncio thread):
+    #      discover address → generate ticket → fire on_ticket callback
+    #      → show ticket dialog in another thread → wait for sender →
+    #      handshake → transfer → done/error
+    #
 
-    def _on_recv(self, icon, item) -> None:
-        ticket = ask_ticket()
-        if not ticket or not ticket.strip():
-            return
-        ticket = ticket.strip()
-
-        try:
-            from lentel.wordlist import parse_ticket
-            parse_ticket(ticket)
-        except ValueError as e:
-            error("Lentel", f"Bad ticket: {e}\n\nCheck for typos and try again.")
-            return
-
-        transfer = self.state.new_transfer("recv", "(connecting\u2026)")
-        self.state.update(transfer, status="connecting\u2026")
+    def _on_receive(self, icon, item) -> None:
+        transfer = self.state.new_transfer("recv", "(awaiting connection)")
+        self.state.update(transfer, status="discovering address\u2026")
         self._refresh()
-        self.runner.submit(self._run_recv(transfer, ticket))
+        self.runner.submit(self._run_recv(transfer))
 
-    async def _run_recv(self, transfer: Transfer, ticket: str) -> None:
+    async def _run_recv(self, transfer: Transfer) -> None:
         started_transferring = [False]
+
+        def on_ticket(ticket: str) -> None:
+            self.state.update(transfer, ticket=ticket, status="waiting for sender")
+            self.state.remember_ticket(ticket)
+            self._refresh()
+            # Show the ticket dialog in a thread so we don't block asyncio.
+            threading.Thread(
+                target=self._show_ticket_dialog, args=(ticket,), daemon=True,
+            ).start()
 
         def on_status(msg: str) -> None:
             self.state.update(transfer, status=msg)
@@ -302,10 +220,10 @@ class TrayApp:
 
         try:
             out = await recv_file(
-                ticket,
                 dest_dir=self.state.config.download_dir,
                 parallel=self.state.config.parallel,
                 progress=progress,
+                on_ticket=on_ticket,
                 on_status=on_status,
             )
             self.state.update(
@@ -320,6 +238,95 @@ class TrayApp:
         except Exception as e:
             self._friendly_error(transfer, "recv", e)
 
+    def _show_ticket_dialog(self, ticket: str) -> None:
+        copy_to_clipboard(ticket)
+        info(
+            "Lentel \u2014 Your Receive Ticket",
+            f"Give this ticket to the sender:\n\n{ticket}\n\n"
+            "It has been copied to your clipboard.\n"
+            "The transfer will start automatically when they\n"
+            "send to this ticket.",
+        )
+
+    # ---- send flow -------------------------------------------------------
+
+    def _on_send_file(self, icon, item) -> None:
+        ticket = self._prompt_ticket_or_cancel()
+        if ticket is None:
+            return
+        path = pick_file("Pick a file to send")
+        if not path:
+            return
+        self._start_send(ticket, path)
+
+    def _on_send_folder(self, icon, item) -> None:
+        ticket = self._prompt_ticket_or_cancel()
+        if ticket is None:
+            return
+        path = pick_directory("Pick a folder to send")
+        if not path:
+            return
+        self._start_send(ticket, path)
+
+    def _prompt_ticket_or_cancel(self) -> Optional[str]:
+        """Ask for a ticket. Returns the validated ticket, or None if cancelled
+        or malformed (with an error dialog shown)."""
+        ticket = ask_ticket()
+        if not ticket or not ticket.strip():
+            return None
+        ticket = ticket.strip()
+        try:
+            from lentel.wordlist import parse_ticket
+            parse_ticket(ticket)
+        except ValueError as e:
+            error("Lentel", f"Bad ticket: {e}\n\nCheck for typos and try again.")
+            return None
+        return ticket
+
+    def _start_send(self, ticket: str, path: str) -> None:
+        name = os.path.basename(path.rstrip(os.sep)) or path
+        size = _path_total_size(path)
+
+        transfer = self.state.new_transfer("send", name)
+        self.state.update(transfer, size=size, ticket=ticket,
+                          status="connecting to receiver\u2026")
+        self._refresh()
+
+        self.runner.submit(self._run_send(transfer, path, ticket))
+
+    async def _run_send(self, transfer: Transfer, path: str, ticket: str) -> None:
+        started_transferring = [False]
+
+        def on_status(msg: str) -> None:
+            self.state.update(transfer, status=msg)
+            self._refresh()
+
+        def progress(done: int, total: int, rate: float) -> None:
+            if not started_transferring[0]:
+                started_transferring[0] = True
+                self.state.update(transfer, status="transferring")
+            self.state.update(transfer, bytes_done=done, rate_bps=rate)
+            if total > 0:
+                pct = 100 * done / total
+                if int(pct) % 2 == 0:
+                    self._refresh()
+
+        try:
+            await send_file(
+                path,
+                ticket,
+                parallel=self.state.config.parallel,
+                progress=progress,
+                on_status=on_status,
+            )
+            self.state.update(transfer,
+                              status="done",
+                              bytes_done=transfer.size or 0)
+            self._notify("Sent", transfer.file_name)
+            self._refresh()
+        except Exception as e:
+            self._friendly_error(transfer, "send", e)
+
     # ---- friendly errors -------------------------------------------------
 
     def _friendly_error(self, transfer: Transfer, direction: str, exc: Exception) -> None:
@@ -333,21 +340,21 @@ class TrayApp:
                 "Cannot discover your public address.\n"
                 "Check your internet connection."
             )
-        elif "No receiver connected" in msg or "timed out waiting" in msg.lower():
+        elif "No sender connected" in msg:
             friendly = (
-                "No receiver connected within the timeout.\n"
-                "Use Send again for a new ticket."
+                "No sender connected within the timeout.\n"
+                "Ask them to try sending again to a new ticket."
             )
-        elif "Could not reach the sender" in msg:
+        elif "handshake timed out" in msg.lower() and direction == "send":
             friendly = (
-                "Could not reach the sender.\n"
-                "Their NAT may block incoming connections.\n"
-                "Ask them to try sending again from a different network."
+                "Could not reach the receiver.\n"
+                "Their network may be blocking incoming connections.\n"
+                "Ask them to try again, or to enable UPnP on their router."
             )
         elif "timeout" in msg.lower() or isinstance(exc, TimeoutError):
             friendly = "Connection timed out. Try again."
         elif "handshake" in msg.lower():
-            friendly = "Handshake failed \u2014 ticket may be wrong or expired."
+            friendly = "Handshake failed \u2014 the ticket may be wrong or expired."
         elif "Merkle" in msg or "integrity" in msg.lower():
             friendly = "File integrity check failed. Try again."
         else:
@@ -368,12 +375,6 @@ class TrayApp:
         n = ask_parallel(self.state.config.parallel)
         if n:
             self.state.set_parallel(int(n))
-
-    def _on_set_relay(self, icon, item) -> None:
-        new = ask_relay(self.state.config.relay_url)
-        if new is None:
-            return  # user cancelled
-        self.state.set_relay_url(new.strip())
 
     # ---- utility callbacks -----------------------------------------------
 
@@ -400,11 +401,12 @@ class TrayApp:
     def _on_about(self, icon, item) -> None:
         info(
             "About Lentel",
-            "Lentel 1.0.0\n\n"
-            "Send any file, any size, to anyone \u2014\n"
+            "Lentel 1.0.5\n\n"
+            "Send any file or folder to anyone \u2014\n"
             "no server, no port forwarding.\n\n"
-            "Your public address is discovered automatically\n"
-            "via STUN/UPnP and embedded in the ticket.\n\n"
+            "The receiver opens a receive session, shares\n"
+            "their ticket, and the sender pushes the payload\n"
+            "directly over an encrypted UDP flow.\n\n"
             f"Downloads: {self.state.config.download_dir}\n"
             f"Parallel:  {self.state.config.parallel} streams",
         )

@@ -1,5 +1,8 @@
 """
-``lentel send`` and ``lentel recv`` — no server needed.
+``lentel recv`` and ``lentel send``.
+
+The receiver opens a listening session and gets a ticket; the sender is
+given the ticket and pushes a file or folder.
 """
 from __future__ import annotations
 
@@ -47,13 +50,47 @@ class ProgressBar:
             sys.stdout.write("\n")
 
 
+async def _cmd_recv(args: argparse.Namespace) -> int:
+    dest_dir = args.out
+    os.makedirs(dest_dir, exist_ok=True)
+
+    def on_ticket(t: str) -> None:
+        print(f"\nticket: {t}")
+        print("give this ticket to the sender.\n")
+
+    def on_status(msg: str) -> None:
+        print(f"  {msg}")
+
+    pb = ProgressBar()
+    try:
+        out = await recv_file(
+            dest_dir=dest_dir,
+            parallel=args.parallel,
+            progress=pb,
+            on_ticket=on_ticket,
+            on_status=on_status,
+            wait_timeout=args.timeout,
+            overwrite=args.overwrite,
+        )
+    except Exception as e:
+        print(f"\nreceive failed: {e}", file=sys.stderr)
+        return 2
+    print(f"saved to {out}")
+    return 0
+
+
 async def _cmd_send(args: argparse.Namespace) -> int:
+    try:
+        parse_ticket(args.ticket)
+    except ValueError as e:
+        print(f"bad ticket: {e}", file=sys.stderr)
+        return 1
+
     path = args.path
     if not os.path.exists(path):
         print(f"error: {path} does not exist", file=sys.stderr)
         return 1
     if os.path.isdir(path):
-        # Sum up all files in the tree for the progress total.
         size = 0
         for dp, _, fn in os.walk(path, followlinks=False):
             for f in fn:
@@ -67,13 +104,8 @@ async def _cmd_send(args: argparse.Namespace) -> int:
     else:
         print(f"error: {path} is not a file or folder", file=sys.stderr)
         return 1
-    print(f"preparing {kind} {os.path.basename(path.rstrip(os.sep)) or path} "
-          f"({_humanbytes(size)})")
-
-    def on_ticket(t: str) -> None:
-        print(f"\nticket: {t}")
-        print("share it with the receiver.")
-        print("waiting for peer...\n")
+    name = os.path.basename(path.rstrip(os.sep)) or path
+    print(f"sending {kind} {name} ({_humanbytes(size)})")
 
     def on_status(msg: str) -> None:
         print(f"  {msg}")
@@ -82,12 +114,10 @@ async def _cmd_send(args: argparse.Namespace) -> int:
     try:
         await send_file(
             path,
+            args.ticket,
             parallel=args.parallel,
             progress=pb,
-            on_ticket=on_ticket,
             on_status=on_status,
-            wait_timeout=args.timeout,
-            relay=args.relay,
         )
     except Exception as e:
         print(f"\nsend failed: {e}", file=sys.stderr)
@@ -96,40 +126,10 @@ async def _cmd_send(args: argparse.Namespace) -> int:
     return 0
 
 
-async def _cmd_recv(args: argparse.Namespace) -> int:
-    try:
-        parse_ticket(args.ticket)
-    except ValueError as e:
-        print(f"bad ticket: {e}", file=sys.stderr)
-        return 1
-    dest_dir = args.out
-    os.makedirs(dest_dir, exist_ok=True)
-
-    def on_status(msg: str) -> None:
-        print(f"  {msg}")
-
-    pb = ProgressBar()
-    print("connecting to sender...")
-    try:
-        out = await recv_file(
-            args.ticket,
-            dest_dir=dest_dir,
-            parallel=args.parallel,
-            progress=pb,
-            overwrite=args.overwrite,
-            on_status=on_status,
-        )
-    except Exception as e:
-        print(f"\nreceive failed: {e}", file=sys.stderr)
-        return 2
-    print(f"saved to {out}")
-    return 0
-
-
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
         prog="lentel",
-        description="Lentel — send any file, any size, to anyone. No server needed.",
+        description="Lentel — receiver-gives-ticket file transfer.",
     )
     p.add_argument("--version", action="version", version=f"lentel {__version__}")
     p.add_argument(
@@ -138,20 +138,20 @@ def main(argv: list[str] | None = None) -> int:
     )
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    ps = sub.add_parser("send", help="send a file or folder")
-    ps.add_argument("path", help="path to the file or folder to send")
-    ps.add_argument("--timeout", type=float, default=300.0,
-                    help="seconds to wait for a receiver (default 300)")
-    ps.add_argument("--relay", default=None, metavar="HOST:PORT",
-                    help="route through a relay (use when direct P2P fails)")
-
-    pr = sub.add_parser("recv", help="receive a file or folder by ticket")
-    pr.add_argument("ticket", help="ticket from the sender (includes @address)")
+    pr = sub.add_parser(
+        "recv", help="open a receive session, print a ticket, wait for a sender",
+    )
     pr.add_argument("--out", default=".", help="destination directory")
+    pr.add_argument("--timeout", type=float, default=300.0,
+                    help="seconds to wait for a sender (default 300)")
     pr.add_argument("--overwrite", action="store_true")
 
+    ps = sub.add_parser("send", help="send a file or folder to a given ticket")
+    ps.add_argument("ticket", help="ticket from the receiver (includes @address)")
+    ps.add_argument("path", help="path to the file or folder to send")
+
     args = p.parse_args(argv)
-    coro = _cmd_send(args) if args.cmd == "send" else _cmd_recv(args)
+    coro = _cmd_recv(args) if args.cmd == "recv" else _cmd_send(args)
     return asyncio.run(coro)
 
 

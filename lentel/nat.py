@@ -1,24 +1,21 @@
 """
-Coordinator-free NAT traversal.
+NAT traversal (receiver-first edition).
 
-Lentel no longer requires a rendezvous server. Instead:
+In Lentel v1.0.5+ the **receiver** is the one who advertises an address:
 
-  1. The SENDER discovers its own public IP:port via public STUN servers
-     (Google, Cloudflare — free, stateless, no account needed) and,
-     optionally, opens a port mapping via UPnP/NAT-PMP on the local router.
-  2. The public address is embedded directly in the ticket:
+  1. Receiver opens a UDP socket and discovers its public IP:port via
+     STUN (``stun.l.google.com``, ``stun.cloudflare.com``) and, optionally,
+     opens a port mapping via UPnP/NAT-PMP on the local router.
+  2. The public address is embedded in the ticket (see ``wordlist.py``):
          bold-crab-fern-42@203.0.113.5:54321
-  3. The sender keeps its NAT mapping alive by sending periodic STUN
-     keepalives.
-  4. The RECEIVER parses the address from the ticket and sends a PUNCH
-     packet directly to the sender. On most home/mobile NATs (full cone,
-     address-restricted, port-restricted) the sender's mapping is still
-     alive so the packet gets through.
-  5. The Lentel handshake then proceeds directly over the punched path.
-
-If UPnP succeeds the sender has a truly reachable port (works with every
-NAT type). If only STUN works, the success depends on the sender's NAT
-being cone-type (covers ~75 %+ of consumer NATs).
+  3. Receiver keeps the NAT mapping alive by sending periodic STUN
+     keepalives, and listens for an incoming Lentel HELLO from any
+     source.
+  4. The **sender** parses the address from the ticket and sends HELLO
+     directly.  On most home/mobile NATs (full cone, address-restricted,
+     port-restricted) the receiver's mapping is warm enough that the HELLO
+     gets through.  If UPnP succeeded the mapping is truly public and any
+     source can reach it.
 
 Public STUN servers used (UDP, stateless, free, no signup):
   - stun.l.google.com:19302
@@ -33,7 +30,9 @@ import struct
 import time
 from typing import Optional
 
-# ---------- STUN (RFC 5389, minimal binding-request client) ---------------
+from .wire import PacketType, decode_header
+
+# ---------- STUN (RFC 5389) -----------------------------------------------
 
 STUN_SERVERS = [
     ("stun.l.google.com", 19302),
@@ -158,7 +157,6 @@ _SSDP_SEARCH = (
 
 
 def _ssdp_discover(timeout: float = 3.0) -> Optional[str]:
-    """Discover the IGD's description URL via SSDP multicast."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.settimeout(timeout)
@@ -180,29 +178,25 @@ def _ssdp_discover(timeout: float = 3.0) -> Optional[str]:
 
 
 def _upnp_get_control_url(desc_url: str) -> Optional[tuple[str, str]]:
-    """Fetch the IGD XML description and extract the WANIPConnection control URL."""
     import urllib.request
     import xml.etree.ElementTree as ET
     try:
         with urllib.request.urlopen(desc_url, timeout=5) as resp:
             tree = ET.parse(resp)
-        ns = {"u": "urn:schemas-upnp-org:device-1-0"}
-        root = tree.getroot()
         base = desc_url.rsplit("/", 1)[0]
+        root = tree.getroot()
         for svc in root.iter():
             if "serviceType" in svc.tag:
                 continue
-            st = svc.findtext("u:serviceType", "", ns)
-            if not st:
-                st = svc.findtext("serviceType", "")
-            if "WANIPConnection" in st or "WANPPPConnection" in st:
-                ctrl = svc.findtext("u:controlURL", "", ns)
-                if not ctrl:
-                    ctrl = svc.findtext("controlURL", "")
-                if ctrl:
-                    if ctrl.startswith("http"):
-                        return ctrl, st
-                    return base + ctrl, st
+            for ns_uri in ("urn:schemas-upnp-org:device-1-0", ""):
+                ns = {"u": ns_uri} if ns_uri else {}
+                st = svc.findtext("u:serviceType", "", ns) if ns else svc.findtext("serviceType", "")
+                if st and ("WANIPConnection" in st or "WANPPPConnection" in st):
+                    ctrl = svc.findtext("u:controlURL", "", ns) if ns else svc.findtext("controlURL", "")
+                    if ctrl:
+                        if ctrl.startswith("http"):
+                            return ctrl, st
+                        return base + ctrl, st
     except Exception:
         pass
     return None
@@ -218,7 +212,6 @@ def _upnp_add_mapping(
     description: str = "Lentel",
     lease: int = 3600,
 ) -> bool:
-    """Send a SOAP AddPortMapping request to the IGD."""
     import urllib.request
     body = (
         '<?xml version="1.0"?>'
@@ -250,37 +243,7 @@ def _upnp_add_mapping(
         return False
 
 
-def _upnp_delete_mapping(
-    control_url: str, service_type: str,
-    external_port: int, protocol: str = "UDP",
-) -> None:
-    import urllib.request
-    body = (
-        '<?xml version="1.0"?>'
-        '<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"'
-        ' s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">'
-        "<s:Body>"
-        f'<u:DeletePortMapping xmlns:u="{service_type}">'
-        "<NewRemoteHost></NewRemoteHost>"
-        f"<NewExternalPort>{external_port}</NewExternalPort>"
-        f"<NewProtocol>{protocol}</NewProtocol>"
-        "</u:DeletePortMapping>"
-        "</s:Body>"
-        "</s:Envelope>"
-    )
-    headers = {
-        "Content-Type": 'text/xml; charset="utf-8"',
-        "SOAPAction": f'"{service_type}#DeletePortMapping"',
-    }
-    req = urllib.request.Request(control_url, body.encode(), headers)
-    try:
-        urllib.request.urlopen(req, timeout=5)
-    except Exception:
-        pass
-
-
 def _get_local_ip() -> str:
-    """Best-effort guess at the LAN IP used to reach the internet."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         s.connect(("8.8.8.8", 80))
@@ -292,13 +255,10 @@ def _get_local_ip() -> str:
 
 
 class UPnPMapping:
-    """RAII wrapper: opens a UPnP mapping on enter, deletes on exit."""
-
     def __init__(self):
         self._ctrl: Optional[str] = None
         self._svc: Optional[str] = None
         self._port: int = 0
-        self.public_ip: Optional[str] = None
         self.public_port: int = 0
 
     def try_map(self, local_port: int) -> bool:
@@ -310,133 +270,17 @@ class UPnPMapping:
             return False
         self._ctrl, self._svc = info
         local_ip = _get_local_ip()
-        ext_port = local_port  # try the same port first
-        if _upnp_add_mapping(self._ctrl, self._svc, ext_port, local_ip, local_port):
-            self._port = ext_port
-            self.public_port = ext_port
+        if _upnp_add_mapping(self._ctrl, self._svc, local_port, local_ip, local_port):
+            self._port = local_port
+            self.public_port = local_port
             return True
         return False
 
-    def close(self) -> None:
-        if self._ctrl and self._port:
-            _upnp_delete_mapping(self._ctrl, self._svc, self._port)
-            self._ctrl = None
 
-
-# ---------- Relay mode (optional fallback for restrictive NATs) -----------
-
-RELAY_MAGIC = b"LNTLRLY\x00"
-RELAY_TOKEN_LEN = 16
-
-
-async def relay_register(
-    sock: socket.socket,
-    relay_addr: tuple[str, int],
-    token: bytes,
-    paired_timeout: float = 300.0,
-    probe_interval: float = 1.0,
-) -> None:
-    """Register with a relay server and wait until the peer also connects.
-
-    The relay pairs the two peers by ``token`` (16 bytes derived from the
-    ticket PSK).  Once both peers have registered, the relay sends a
-    ``LNTLRLY\\x00 + token + 0xFF`` ACK to each.  We keep sending
-    registration probes every ``probe_interval`` seconds because the NAT
-    mapping to the relay needs to stay warm, and because UDP packets can be
-    dropped.
-
-    Raises NATError on timeout or if the relay can't be reached at all.
-    """
-    if len(token) != RELAY_TOKEN_LEN:
-        raise ValueError(f"token must be {RELAY_TOKEN_LEN} bytes")
-
-    loop = asyncio.get_event_loop()
-    pkt = RELAY_MAGIC + token
-    deadline = time.monotonic() + paired_timeout
-    first_ack = False
-
-    while time.monotonic() < deadline:
-        try:
-            await loop.sock_sendto(sock, pkt, relay_addr)
-        except OSError as e:
-            raise NATError(f"Could not reach relay at {relay_addr}: {e}") from e
-
-        try:
-            data, src = await asyncio.wait_for(
-                loop.sock_recvfrom(sock, 2048), timeout=probe_interval,
-            )
-        except asyncio.TimeoutError:
-            continue
-        except OSError:
-            continue
-
-        # Accept replies only from the relay.
-        if src != relay_addr:
-            # Stray packet — could be a direct PUNCH from the peer if our
-            # NAT actually allowed it through.  Ignore for now; the caller
-            # will do its own handshake next.
-            continue
-
-        if not data.startswith(RELAY_MAGIC):
-            continue
-        if len(data) < len(RELAY_MAGIC) + RELAY_TOKEN_LEN + 1:
-            continue
-        if data[len(RELAY_MAGIC):len(RELAY_MAGIC) + RELAY_TOKEN_LEN] != token:
-            continue
-
-        flag = data[len(RELAY_MAGIC) + RELAY_TOKEN_LEN]
-        if flag == 0xFF:
-            # Relay confirms: both peers registered.  We're paired.
-            return
-        if flag == 0x00:
-            # Registered but peer hasn't arrived yet.  Keep probing.
-            first_ack = True
-            continue
-
-    if first_ack:
-        raise NATError(
-            "Connected to relay but the other peer never showed up.\n"
-            "Make sure they are using the same ticket."
-        )
-    raise NATError(
-        f"Could not reach the relay at {relay_addr[0]}:{relay_addr[1]}.\n"
-        "Check the relay URL and your internet connection."
-    )
-
-
-def parse_relay_url(url: str) -> tuple[str, int]:
-    """Parse ``host:port``, ``udp://host:port``, etc. into a (host, port) tuple."""
-    s = url.strip()
-    if "://" in s:
-        s = s.split("://", 1)[1]
-    s = s.rstrip("/")
-    if ":" not in s:
-        raise ValueError(f"relay URL must include a port: {url!r}")
-    host, port_s = s.rsplit(":", 1)
-    try:
-        port = int(port_s)
-    except ValueError:
-        raise ValueError(f"bad relay port: {port_s!r}")
-    if port < 1 or port > 65535:
-        raise ValueError(f"relay port out of range: {port}")
-    return host, port
-
-
-# ---------- Sender: discover address + wait for peer ----------------------
-
-PUNCH_MAGIC = b"LNTLPUNCH"
-
-
-async def discover_public_address(
-    sock: socket.socket,
-) -> tuple[str, int, str]:
-    """
-    Discover this socket's public address. Returns (ip, port, method).
-    method is "upnp" or "stun".
-    """
+async def discover_public_address(sock: socket.socket) -> tuple[str, int, str]:
+    """Discover this socket's public address.  Returns (ip, port, method)."""
     local_port = sock.getsockname()[1]
 
-    # 1. Try UPnP (gives a real public port — works with all NAT types).
     mapping = UPnPMapping()
     try:
         upnp_ok = await asyncio.get_event_loop().run_in_executor(
@@ -446,27 +290,29 @@ async def discover_public_address(
         upnp_ok = False
 
     if upnp_ok and mapping.public_port:
-        # Still need our public IP — get it via STUN.
         try:
             ip, _ = await stun_discover(sock)
             return ip, mapping.public_port, "upnp"
         except NATError:
             pass
 
-    # 2. Fall back to STUN (learns reflexive address for cone NATs).
     ip, port = await stun_discover(sock)
     return ip, port, "stun"
 
 
-async def sender_wait_for_peer(
-    sock: socket.socket,
-    cookie: bytes,
-    timeout: float = 300.0,
-) -> tuple[str, int]:
-    """
-    Sender: keep the NAT mapping alive and wait for the receiver's PUNCH.
+# ---------- Receiver: listen for sender's HELLO ---------------------------
 
-    Returns the receiver's (ip, port) once a valid punch is received.
+async def responder_wait_for_hello(
+    sock: socket.socket,
+    timeout: float = 300.0,
+) -> tuple[bytes, tuple[str, int]]:
+    """Listen for a Lentel HELLO packet from **any** source.
+
+    Keeps the NAT mapping warm with periodic STUN keepalives in the
+    background (the STUN responses are ignored — they don't parse as
+    Lentel headers, so they're dropped by the filter below).
+
+    Returns (hello_packet, sender_addr) once a valid HELLO arrives.
     """
     loop = asyncio.get_event_loop()
     stop_keepalive = asyncio.Event()
@@ -477,27 +323,23 @@ async def sender_wait_for_peer(
         while time.monotonic() < deadline:
             remaining = max(0.1, deadline - time.monotonic())
             try:
-                data, addr = await asyncio.wait_for(
-                    loop.sock_recvfrom(sock, 2048), timeout=min(remaining, 2.0),
+                data, src = await asyncio.wait_for(
+                    loop.sock_recvfrom(sock, 65535),
+                    timeout=min(remaining, 5.0),
                 )
             except asyncio.TimeoutError:
                 continue
 
-            # Accept PUNCH packets with the matching cookie.
-            if (
-                len(data) >= len(PUNCH_MAGIC) + len(cookie)
-                and data[: len(PUNCH_MAGIC)] == PUNCH_MAGIC
-                and data[len(PUNCH_MAGIC) : len(PUNCH_MAGIC) + len(cookie)] == cookie
-            ):
-                # Reply so the receiver knows we're alive.
-                try:
-                    reply = PUNCH_MAGIC + cookie + b"\x01"
-                    await loop.sock_sendto(sock, reply, addr)
-                except Exception:
-                    pass
-                return addr
+            # Reject non-Lentel traffic (STUN replies, stray UDP).
+            try:
+                h = decode_header(data)
+            except Exception:
+                continue
+            if h.type is PacketType.HELLO:
+                return data, src
+            # Any other Lentel packet before HELLO is ignored.
 
-        raise NATError("No receiver connected within the timeout.")
+        raise NATError("No sender connected within the timeout.")
     finally:
         stop_keepalive.set()
         keepalive_task.cancel()
@@ -505,49 +347,3 @@ async def sender_wait_for_peer(
             await keepalive_task
         except (asyncio.CancelledError, Exception):
             pass
-
-
-# ---------- Receiver: connect to sender -----------------------------------
-
-async def receiver_punch(
-    sock: socket.socket,
-    peer: tuple[str, int],
-    cookie: bytes,
-    timeout: float = 30.0,
-    interval: float = 0.2,
-) -> tuple[str, int]:
-    """
-    Receiver: send PUNCH packets to the sender's public address and wait
-    for an acknowledgement. Returns the confirmed peer address.
-    """
-    loop = asyncio.get_event_loop()
-    punch_pkt = PUNCH_MAGIC + cookie
-    deadline = time.monotonic() + timeout
-
-    while time.monotonic() < deadline:
-        # Send a punch.
-        try:
-            await loop.sock_sendto(sock, punch_pkt, peer)
-        except Exception:
-            pass
-
-        # Wait briefly for a reply.
-        try:
-            data, addr = await asyncio.wait_for(
-                loop.sock_recvfrom(sock, 2048), timeout=interval,
-            )
-            if (
-                data.startswith(PUNCH_MAGIC)
-                and len(data) >= len(PUNCH_MAGIC) + len(cookie)
-                and data[len(PUNCH_MAGIC) : len(PUNCH_MAGIC) + len(cookie)] == cookie
-            ):
-                return addr
-        except asyncio.TimeoutError:
-            continue
-
-    raise NATError(
-        "Could not reach the sender.\n"
-        "Their NAT may have blocked the connection.\n"
-        "Ask the sender to try again — if it keeps failing, one of you\n"
-        "may need to use a network without a strict/symmetric NAT."
-    )

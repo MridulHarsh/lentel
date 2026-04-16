@@ -5,9 +5,11 @@
 Lentel is a new UDP-based protocol for point-to-point file transfer. It is
 designed to:
 
-1. Move **files of any size** between two hosts **anywhere on the Internet**.
-2. Work **without port forwarding** by coordinating NAT hole-punching via a
-   public rendezvous server.
+1. Move **files or folders of any size** between two hosts anywhere on
+   the Internet.
+2. Work **without port forwarding and without any server** — the receiver
+   advertises its STUN/UPnP-discovered public address inside the ticket;
+   the sender pushes directly to that address.
 3. Saturate the **full available bandwidth** using parallel streams and a
    BBR-inspired bandwidth-probing congestion controller (not loss-based).
 4. Provide **end-to-end confidentiality, integrity, and authenticity** using

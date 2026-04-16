@@ -7,80 +7,86 @@
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-green.svg)](LICENSE)
 
-Lentel is a from-scratch file transfer protocol and application. No existing
-protocol is used — the wire format, handshake, reliability layer, congestion
-controller, NAT traversal, and application framing are all new. The only
-runtime dependency is `cryptography` for AEAD and key-exchange primitives.
+Lentel is a from-scratch file transfer protocol and application. No
+existing protocol is used — the wire format, handshake, reliability
+layer, congestion controller, NAT traversal, and application framing are
+all new. The only runtime dependency is `cryptography` for AEAD and
+key-exchange primitives.
 
-**No server of any kind is required.** The sender's public address is
-discovered automatically via STUN/UPnP and embedded in the ticket. The
-receiver connects directly.
+**Receiver-first, consent-based**: the person who *wants* a file opens a
+receive session, gets a ticket, and gives it to the sender. The sender
+then uses that ticket to push the file. Nothing lands on a device that
+hasn't opened itself up for a transfer.
 
 ## Download
 
 | Platform | Download | Notes |
 |----------|----------|-------|
-| **macOS** | [Lentel-macOS.dmg](https://github.com/MridulHarsh/lentel/releases/latest/download/Lentel-macOS.dmg) | Open DMG, drag to Applications. Menu-bar app (no dock icon). |
-| **Windows** | [Lentel.exe](https://github.com/MridulHarsh/lentel/releases/latest/download/Lentel.exe) | Single file. Run it — appears in the system tray. |
+| **macOS** | [Lentel-macOS.dmg](https://github.com/MridulHarsh/lentel/releases/latest/download/Lentel-macOS.dmg) | Open DMG, drag to Applications. Menu-bar app. |
+| **Windows** | [Lentel.exe](https://github.com/MridulHarsh/lentel/releases/latest/download/Lentel.exe) | Single file. Runs in the system tray. |
 | **Any OS (pip)** | `pip install lentel` | CLI + Python API. Add `[tray]` for the GUI. |
 
 ### macOS: "Lentel is damaged and can't be opened"
 
-This is **not** actually a damaged app. Apple's Gatekeeper shows this
-error for any app that isn't signed with a paid ($99/year) Apple
-Developer certificate — every open-source Mac app distributed outside
-the App Store hits this. Two ways to fix it:
-
-1. **Use the included helper**: after opening the DMG, double-click
-   **`Fix 'damaged app' error.command`**. It runs a one-line command that
-   strips the quarantine attribute. Then launch Lentel normally.
-
-2. **Or run it yourself** in Terminal:
-   ```bash
-   xattr -cr /Applications/Lentel.app
-   ```
-   Then launch Lentel normally. You only need to do this once.
+This is **not** a broken app. Apple's Gatekeeper shows this for anything
+not signed with a $99/year Apple Developer cert. The DMG includes a
+helper — **`Fix damaged app error.command`** — that one-shots the fix.
+Or run:
+```bash
+xattr -cr /Applications/Lentel.app
+```
 
 ## How it works
 
 ```
- Sender                                              Receiver
-   │                                                     │
-   │  1. Discovers own public IP:port                    │
-   │     via free STUN servers (Google, Cloudflare)      │
-   │     + optional UPnP port mapping                    │
-   │                                                     │
-   │  2. Generates ticket:                               │
-   │     bold-crab-fern-42@203.0.113.5:54321             │
-   │                   ─────────────────────▶            │
-   │     (share via chat, email, phone, etc.)            │
-   │                                                     │
-   │                                       3. Parses IP  │
-   │                                          from ticket│
-   │                                                     │
-   │  ◀════════════ direct UDP connection ══════════════▶ │
-   │                                                     │
-   │  4. X25519 + ChaCha20-Poly1305 handshake            │
-   │  5. Parallel encrypted transfer (4 streams)         │
-   │  6. BLAKE2b Merkle verification                     │
-   │                                                     │
-   ✓  Done — no server touched any of your data          ✓
+ Receiver                                             Sender
+    │                                                    │
+    │  1. Click "Receive"                                 │
+    │     → discover public IP:port via STUN/UPnP         │
+    │     → ticket:                                       │
+    │          bold-crab-fern-42@203.0.113.5:54321        │
+    │     → wait for a connection                         │
+    │                                                     │
+    │                       ← shares ticket (any channel) │
+    │                                                     │
+    │                                      2. Click "Send"│
+    │                                         paste ticket│
+    │                                         pick file   │
+    │                                                     │
+    │  ◀═══════════════ direct UDP flow ═════════════════▶│
+    │                                                     │
+    │  3. X25519 + ChaCha20-Poly1305 handshake            │
+    │  4. Parallel encrypted transfer (4 streams)         │
+    │  5. BLAKE2b Merkle verification                     │
+    │                                                     │
+    ✓  File or folder saved                          ✓ Sent
 ```
 
-**No coordinator, no relay, no account, no signup.** The ticket IS the
-connection string.
+**No coordinator, no relay, no account.** The ticket *is* the rendezvous
+address.
+
+## Why receiver-first
+
+- **Consent model.** You have to actively open a receive session before
+  anyone can push a file to you. No drive-by transfers.
+- **Tickets are single-use.** Close the receive dialog and the ticket
+  expires — the socket is gone.
+- **Easier on NAT.** The receiver is the one maintaining a STUN-warmed
+  UDP mapping. The sender just opens an outbound flow, which every NAT
+  lets through.
 
 ## Desktop app
 
-The tray app runs in your **macOS menu bar** or **Windows system tray**:
+Click the **L** icon in your menu bar / system tray:
 
 ```
-  ↑ Send a file…          ← pick a file, get a ticket
-  ↑ Send a folder…        ← pick a folder, transferred as a tree (no zipping)
-  ↓ Receive…              ← paste a ticket, get the file or folder
+  ↓ Receive a file or folder…   ← generates a ticket, waits
+  ──────────────────
+  ↑ Send a file…                 ← paste ticket, pick file
+  ↑ Send a folder…               ← paste ticket, pick folder
   ──────────────────
   Active transfers ▸
-    ↑ video.mkv  72%  45.2 MB/s
+    ↑ video.mkv  72%  45 MB/s
   Clear finished
   ──────────────────
   Copy last ticket
@@ -90,11 +96,10 @@ The tray app runs in your **macOS menu bar** or **Windows system tray**:
     Downloads folder…
     Parallel streams: 4
   ──────────────────
-  About
-  Quit
+  About · Quit
 ```
 
-The icon lights up blue when a transfer is active.
+The icon lights up blue when a transfer is in progress.
 
 ## CLI
 
@@ -102,126 +107,59 @@ The icon lights up blue when a transfer is active.
 pip install lentel
 ```
 
-**Send a file:**
+**Receiver** (the one who wants a file): generates a ticket and waits.
+
 ```
-$ lentel send ./video.mkv
+$ lentel recv
   Discovering public address…
   Public address: 203.0.113.5:54321 (stun)
 
 ticket: bold-crab-fern-42@203.0.113.5:54321
-share it with the receiver.
-waiting for peer...
+give this ticket to the sender.
 
- [####################----------] 65.0%  421.3 MB/612.0 MB  52.7 MB/s  eta 3s
-```
-
-**Send a folder** (transferred as a tree — no zipping):
-```
-$ lentel send ./my-project
-  preparing folder my-project (42.3 MB)
-  Discovering public address…
-ticket: bold-crab-fern-42@203.0.113.5:54321
-```
-
-**Receive:**
-```
-$ lentel recv bold-crab-fern-42@203.0.113.5:54321
-  Connecting to sender…
-  Connected — handshaking…
+  Waiting for sender…
+  Sender connected from 198.51.100.9:42001 — handshaking…
   Receiving…
 
- [##############################] 100.0%  612.0 MB/612.0 MB  48.1 MB/s  eta 0s
+ [##############################] 100.0%  612.0 MB  48 MB/s  eta 0s
 saved to ./video.mkv
 ```
 
-That's it. No flags, no config, no server URL.
+**Sender**: takes the ticket as the first argument, file path as the second.
+
+```
+$ lentel send bold-crab-fern-42@203.0.113.5:54321 ./video.mkv
+sending file video.mkv (612.0 MB)
+  Resolving 203.0.113.5…
+  Connecting to receiver at 203.0.113.5:54321…
+  Handshake complete — transferring…
+
+ [##############################] 100.0%  612.0 MB  48 MB/s  eta 0s
+transfer complete.
+```
+
+Works the same for folders — `lentel send <ticket> ./my-folder`.
 
 ## Python API
 
 ```python
 import asyncio
-from lentel import send_file, recv_file
+from lentel import recv_file, send_file
 
-# Sender
-async def send():
-    ticket = await send_file(
-        "./video.mkv",
-        on_ticket=lambda t: print(f"ticket: {t}"),
-    )
-
-# Receiver (on another machine)
+# Receiver
 async def receive():
     path = await recv_file(
-        "bold-crab-fern-42@203.0.113.5:54321",
         dest_dir="./downloads",
+        on_ticket=lambda t: print(f"ticket: {t}"),
     )
-    print(f"saved to {path}")
+    print("saved to", path)
 
-asyncio.run(send())   # or receive()
+# Sender (on the other machine)
+async def send():
+    await send_file("./video.mkv", "bold-crab-fern-42@203.0.113.5:54321")
+
+asyncio.run(receive())   # or send()
 ```
-
-## Why it's fast
-
-| Feature | What it does |
-|---------|-------------|
-| **BBR-inspired congestion** | Loss-tolerant — keeps probing bandwidth instead of halving on every drop |
-| **4 parallel streams** | Shares one UDP socket + one cipher state; no head-of-line blocking |
-| **Selective ACK + NACK** | Fast retransmit at 1.5x SRTT; explicit retransmit requests for integrity failures |
-| **64 KiB chunks** | Hashed with BLAKE2b, verified on receive, written directly to disk |
-| **Resumable** | Reconnect and the sender skips already-verified chunks |
-
-## Why you don't need port forwarding
-
-Lentel discovers the sender's reachable address automatically:
-
-1. **UPnP (tried first)** — asks your router to open a port via IGD SOAP.
-   Works on most home routers. If it succeeds, you're reachable from anywhere.
-
-2. **STUN (fallback)** — queries free public STUN servers (`stun.l.google.com`,
-   `stun.cloudflare.com`) to learn your NAT's external IP:port. The sender
-   keeps the mapping alive with periodic keepalives. Works with cone-type NATs
-   (~75%+ of consumer routers).
-
-The discovered address is embedded in the ticket. The receiver connects
-directly — no middleman.
-
-### When direct P2P doesn't work: use a relay
-
-Some networks (symmetric NATs, some corporate / mobile / hotel Wi-Fi)
-strip incoming connections entirely. If you see the error
-**"Could not reach the sender. Their NAT may block incoming connections"**,
-switch to **relay mode**:
-
-1. **Run a relay** on any machine with a public IP — a $4 VPS is plenty,
-   the relay uses ~zero CPU and only pushes the bytes of the transfer:
-
-   ```bash
-   pip install lentel
-   lentel-relay --bind 0.0.0.0:7778
-   ```
-
-   Make sure UDP port `7778` is open in the VPS firewall.
-
-2. **Configure the app** (macOS / Windows tray): open the tray icon →
-   **Settings → Relay:** → enter `your-vps.example.com:7778`. Leave the
-   field empty at any time to switch back to direct P2P.
-
-3. **Send normally.** The ticket now encodes the relay's address instead
-   of yours (`bold-crab-fern-42@r:your-vps.example.com:7778`). Both peers
-   connect to the relay, which forwards opaque UDP datagrams between
-   them. The relay **cannot decrypt anything** — your AEAD keys are
-   derived from the ticket PSK and never leave either peer.
-
-CLI:
-```bash
-lentel send ./big.mkv --relay your-vps.example.com:7778
-# receiver:
-lentel recv bold-crab-fern-42@r:your-vps.example.com:7778
-```
-
-Relay mode works on **any** NAT type. The only downside is that the
-transfer speed is bounded by the relay's bandwidth instead of your direct
-link — still plenty fast for most files.
 
 ## Security
 
@@ -229,16 +167,49 @@ link — still plenty fast for most files.
 |-------|-----------|
 | Key exchange | X25519 ephemeral + ticket PSK |
 | Encryption | ChaCha20-Poly1305 AEAD (every packet) |
-| Integrity | BLAKE2b Merkle tree over 64 KiB chunks |
+| Integrity | BLAKE2b Merkle tree, per-file root, 64 KiB chunks |
 | Authentication | 3-message Noise-style handshake (ticket = pre-shared key) |
 | Nonces | Deterministic from (direction, stream, sequence) — never reused |
 
-- The ticket's word code is hashed into a 32-byte PSK. Without it, an
-  attacker cannot complete the handshake or decrypt any packet.
-- A passive eavesdropper cannot see the file name, size, or contents.
-- Tickets are single-use and ephemeral — a new one is generated per transfer.
+- The ticket's word-code is hashed into a 32-byte PSK. Without that PSK
+  an attacker cannot complete the handshake, even if they intercept the
+  ticket string.
+- A passive eavesdropper cannot see file names, sizes, or contents.
+- Tickets are ephemeral — a new one is generated each receive session.
 
 Full wire specification: [PROTOCOL.md](PROTOCOL.md)
+
+## Why it's fast
+
+| Feature | What it does |
+|---------|-------------|
+| **BBR-inspired congestion** | Loss-tolerant; keeps probing bandwidth instead of halving on every drop |
+| **4 parallel streams** | Shares one UDP socket + one cipher state; no head-of-line blocking |
+| **Selective ACK + NACK** | Fast retransmit at 1.5×SRTT; explicit retransmit requests for integrity failures |
+| **64 KiB chunks, multi-file** | Folders transferred as a tree with per-file Merkle roots — no zipping |
+| **Resumable** | On reconnect the sender skips already-verified chunks |
+
+## Why no port forwarding
+
+The **receiver** discovers its public address automatically:
+
+1. **UPnP (tried first)** — asks the local router to open a port via
+   IGD SOAP. Works on most home routers. If it succeeds, the receiver is
+   publicly reachable regardless of NAT type.
+2. **STUN (fallback)** — queries free public STUN servers
+   (`stun.l.google.com`, `stun.cloudflare.com`) to learn the NAT's
+   external IP:port. The receiver sends STUN keepalives while listening
+   to hold the mapping open. Works with cone-type NATs (~75 %+ of
+   consumer routers).
+
+The discovered address is embedded in the ticket. The sender parses it
+and connects directly.
+
+If the receiver's NAT is strict enough that neither UPnP nor STUN
+punches a hole (rare — mostly symmetric NATs on mobile carriers), the
+sender's HELLO may not reach the receiver. Usual remedies: enable UPnP
+on the receiver's router, try from a different network (mobile hotspot,
+a friend's Wi-Fi), or use a host with a real public IP.
 
 ## Project layout
 
@@ -248,45 +219,38 @@ lentel/
 ├── crypto.py          # X25519 handshake + ChaCha20-Poly1305 AEAD
 ├── congestion.py      # BBR-lite controller (STARTUP/DRAIN/PROBE_BW/PROBE_RTT)
 ├── transport.py       # Reliable UDP: SACK, NACK, pacing, parallel streams
-├── nat.py             # STUN client (RFC 5389) + UPnP IGD port mapping
-├── chunker.py         # File → 64 KiB chunks + BLAKE2b Merkle tree
+├── nat.py             # STUN + UPnP; responder_wait_for_hello()
+├── chunker.py         # File/folder → 64 KiB chunks + Merkle tree
 ├── session.py         # Send/recv state machines + resume
-├── rendezvous.py      # Orchestrates: discover → ticket → punch → transfer
+├── rendezvous.py      # Orchestrates: recv_file generates ticket; send_file uses it
 ├── wordlist.py        # Ticket encoding (words + checksum + @IP:PORT)
-├── cli.py             # `lentel send` / `lentel recv`
-├── app/               # macOS menu-bar / Windows system-tray GUI
-│   ├── tray.py        #   pystray Icon + dynamic Menu
-│   ├── dialogs.py     #   osascript (macOS) / tkinter (Windows) prompts
-│   ├── state.py       #   Thread-safe transfer registry + config
-│   ├── runner.py      #   Asyncio event loop on worker thread
-│   └── icon.py        #   Procedurally drawn tray icon
-└── server/            # (Optional) coordinator + relay for legacy/fallback
+├── cli.py             # `lentel recv` / `lentel send`
+└── app/               # macOS menu-bar / Windows system-tray GUI
 ```
 
 ## Building from source
 
-**macOS:**
+**macOS**
 ```bash
 cd packaging/macos && ./build.sh
 open dist/Lentel.app
 ```
 
-**Windows:**
+**Windows**
 ```powershell
 cd packaging\windows
 .\build.ps1
 .\dist\Lentel.exe
 ```
 
-**From pip (any OS):**
+**Pip (any OS)**
 ```bash
 pip install 'lentel[tray]'
 python -m lentel.app
 ```
 
-Builds are automated — every version tag pushed to GitHub triggers a
-[GitHub Actions workflow](.github/workflows/release.yml) that builds both
-platforms and publishes them as release assets.
+Every version tag pushed to GitHub triggers a workflow that builds both
+platforms and publishes them as [release assets](https://github.com/MridulHarsh/lentel/releases).
 
 ## Running tests
 
@@ -295,20 +259,9 @@ pip install -e . && pip install pytest
 python -m pytest tests/ -v
 ```
 
-24 tests: 20 unit (wire, crypto, chunker, congestion, wordlist, STUN) +
-4 end-to-end (loopback transfers through the full pipeline).
-
-## How to release a new version
-
-```bash
-# Bump version in pyproject.toml and lentel/__init__.py, then:
-git add -A && git commit -m "v1.1.0"
-git tag v1.1.0
-git push origin main v1.1.0
-```
-
-GitHub Actions will automatically build `Lentel-macOS.dmg` + `Lentel.exe`
-and publish them as a [GitHub Release](https://github.com/MridulHarsh/lentel/releases).
+33 tests: 26 unit (wire, crypto, chunker, congestion, wordlist, STUN) + 7
+end-to-end (single-file + folder loopback transfers through the full
+receiver-first pipeline).
 
 ## License
 

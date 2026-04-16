@@ -194,19 +194,6 @@ def ask_coordinator(default: str) -> Optional[str]:
     return _tk_ask_string("Lentel Coordinator", prompt, default)
 
 
-def ask_relay(default: str) -> Optional[str]:
-    prompt = (
-        "Relay URL  (host:port)\\n\\n"
-        "Leave empty for direct peer-to-peer.\\n"
-        "Set to e.g.  relay.example.com:7778  to route through a relay\\n"
-        "when your NAT blocks incoming connections.\\n\\n"
-        "The relay never sees plaintext."
-    )
-    if _IS_MAC:
-        return _mac_ask_string("Lentel Relay", prompt, default)
-    return _tk_ask_string("Lentel Relay", prompt, default)
-
-
 def ask_parallel(default: int) -> Optional[int]:
     prompt = "How many parallel streams? (1-16)"
     if _IS_MAC:
