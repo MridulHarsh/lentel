@@ -41,9 +41,16 @@ from .wordlist import new_ticket as _gen_ticket, parse_ticket
 
 async def _make_socket(bind_addr: str = "0.0.0.0", bind_port: int = 0) -> socket.socket:
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    # Note: we deliberately do NOT set SO_REUSEADDR on UDP — on Windows
+    # this allows another process on the same machine to hijack the port
+    # and snoop the encrypted datagrams, and we have no need to bind
+    # multiple sockets to the same port.
     sock.setblocking(False)
-    sock.bind((bind_addr, bind_port))
+    try:
+        sock.bind((bind_addr, bind_port))
+    except OSError:
+        # Fallback if the requested port is unavailable.
+        sock.bind((bind_addr, 0))
     try:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
@@ -193,7 +200,14 @@ async def recv_file(
         else:
             _status("Discovering public address\u2026")
             pub_ip, pub_port, method = await discover_public_address(sock)
-            _status(f"Public address: {pub_ip}:{pub_port} ({method})")
+            if method == "lan":
+                _status(
+                    f"Could not reach any STUN server \u2014 using LAN address "
+                    f"{pub_ip}:{pub_port}. This ticket only works on your "
+                    f"local network."
+                )
+            else:
+                _status(f"Public address: {pub_ip}:{pub_port} ({method})")
 
         ticket = _gen_ticket((pub_ip, pub_port))
         code, _ = parse_ticket(ticket)

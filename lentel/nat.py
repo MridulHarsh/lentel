@@ -88,35 +88,77 @@ def _parse_stun_response(data: bytes, txn_id: bytes) -> Optional[tuple[str, int]
     return None
 
 
+async def _resolve_udp_addr(
+    loop: asyncio.AbstractEventLoop, host: str, port: int,
+) -> Optional[tuple[str, int]]:
+    """Resolve ``(host, port)`` to ``(ip, port)`` using the event loop.
+
+    Required on Windows: ``loop.sock_sendto`` under the ProactorEventLoop
+    expects an already-resolved IPv4 address and will fail for a hostname.
+    """
+    try:
+        infos = await loop.getaddrinfo(
+            host, port, family=socket.AF_INET, type=socket.SOCK_DGRAM,
+        )
+    except (socket.gaierror, OSError):
+        return None
+    for family, _, _, _, sockaddr in infos:
+        if family == socket.AF_INET:
+            return sockaddr  # (ip, port)
+    return None
+
+
 async def stun_discover(
     sock: socket.socket,
     servers: list[tuple[str, int]] | None = None,
     retries: int = 3,
     timeout: float = 2.0,
 ) -> tuple[str, int]:
-    """Query public STUN servers to learn this socket's reflexive address."""
+    """Query public STUN servers to learn this socket's reflexive address.
+
+    Hostnames are resolved via ``loop.getaddrinfo`` before any UDP send
+    (Windows winsock requires a resolved IPv4 address in ``sendto``).
+    """
     loop = asyncio.get_event_loop()
     servers = servers or list(STUN_SERVERS)
-    last_err: Optional[Exception] = None
-    for server in servers:
+    errors: list[str] = []
+
+    for host, port in servers:
+        resolved = await _resolve_udp_addr(loop, host, port)
+        if resolved is None:
+            errors.append(f"DNS failed for {host}")
+            continue
+
         pkt, txn_id = _build_stun_request()
-        for _ in range(retries):
+        server_failed = False
+        for attempt in range(retries):
             try:
-                await loop.sock_sendto(sock, pkt, server)
-                data, _ = await asyncio.wait_for(
+                await loop.sock_sendto(sock, pkt, resolved)
+            except OSError as e:
+                errors.append(f"{host}: send failed ({e})")
+                server_failed = True
+                break
+            try:
+                data, _src = await asyncio.wait_for(
                     loop.sock_recvfrom(sock, 1024), timeout=timeout,
                 )
-                result = _parse_stun_response(data, txn_id)
-                if result:
-                    return result
             except asyncio.TimeoutError:
                 continue
-            except Exception as e:
-                last_err = e
+            except OSError as e:
+                errors.append(f"{host}: recv failed ({e})")
+                server_failed = True
                 break
+            result = _parse_stun_response(data, txn_id)
+            if result:
+                return result
+        if not server_failed:
+            errors.append(f"{host}: timed out after {retries} attempts")
+
+    detail = "; ".join(errors) if errors else "all timed out"
     raise NATError(
-        f"Could not reach any STUN server ({last_err or 'all timed out'}). "
-        "Check your internet connection."
+        f"Could not reach any public STUN server ({detail}).\n"
+        "Possible causes: firewall blocking outbound UDP to ports 3478/19302, "
+        "no internet connection, or a very restrictive network."
     )
 
 
@@ -277,10 +319,21 @@ class UPnPMapping:
         return False
 
 
-async def discover_public_address(sock: socket.socket) -> tuple[str, int, str]:
-    """Discover this socket's public address.  Returns (ip, port, method)."""
+async def discover_public_address(
+    sock: socket.socket,
+    allow_lan_fallback: bool = True,
+) -> tuple[str, int, str]:
+    """Discover this socket's public address.
+
+    Returns ``(ip, port, method)`` where ``method`` is one of
+    ``"upnp"`` / ``"stun"`` / ``"lan"``.  The ``lan`` fallback is used
+    when STUN fails entirely (firewall, no internet, symmetric NAT) —
+    the returned address is the local LAN IP, so the ticket works only
+    for sender/receiver on the same network.
+    """
     local_port = sock.getsockname()[1]
 
+    # 1. UPnP (best case — real public port).
     mapping = UPnPMapping()
     try:
         upnp_ok = await asyncio.get_event_loop().run_in_executor(
@@ -296,8 +349,22 @@ async def discover_public_address(sock: socket.socket) -> tuple[str, int, str]:
         except NATError:
             pass
 
-    ip, port = await stun_discover(sock)
-    return ip, port, "stun"
+    # 2. STUN (works for cone-type NATs).
+    try:
+        ip, port = await stun_discover(sock)
+        return ip, port, "stun"
+    except NATError as stun_err:
+        if not allow_lan_fallback:
+            raise
+        # 3. Last-resort LAN fallback.
+        local_ip = _get_local_ip()
+        if local_ip and local_ip not in ("0.0.0.0", "127.0.0.1"):
+            return local_ip, local_port, "lan"
+        raise NATError(
+            f"{stun_err}\n\n"
+            "Could not determine any usable address at all. "
+            "Is this machine connected to a network?"
+        )
 
 
 # ---------- Receiver: listen for sender's HELLO ---------------------------

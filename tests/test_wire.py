@@ -232,3 +232,37 @@ def test_stun_request_format():
     msg_type, msg_len, magic = struct.unpack_from("!HHI", pkt, 0)
     assert msg_type == _BINDING_REQUEST
     assert magic == _STUN_MAGIC
+
+
+# ---------- discover_public_address LAN fallback --------------------------
+
+def test_discover_lan_fallback_when_stun_fails():
+    """If STUN can't reach any server, we must fall back to the LAN IP
+    so same-network transfers still work."""
+    import asyncio
+    import socket
+
+    import lentel.nat as nat
+
+    async def run():
+        # Use a throwaway UDP socket; we won't actually send anything.
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setblocking(False)
+        sock.bind(("127.0.0.1", 0))
+        try:
+            # Force STUN to fail by pointing at an unroutable address.
+            saved_servers = nat.STUN_SERVERS
+            nat.STUN_SERVERS = [("240.0.0.1", 19302)]  # reserved, unroutable
+            try:
+                ip, port, method = await nat.discover_public_address(
+                    sock, allow_lan_fallback=True,
+                )
+                assert method == "lan"
+                assert port == sock.getsockname()[1]
+                assert ip not in ("0.0.0.0", "127.0.0.1")
+            finally:
+                nat.STUN_SERVERS = saved_servers
+        finally:
+            sock.close()
+
+    asyncio.run(run())

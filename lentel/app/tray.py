@@ -337,8 +337,11 @@ class TrayApp:
             friendly = f"File not found: {msg}"
         elif "STUN" in msg or "stun" in msg:
             friendly = (
-                "Cannot discover your public address.\n"
-                "Check your internet connection."
+                "Could not discover a public address AND "
+                "no LAN address is available.\n\n"
+                "On Windows: check that Windows Defender Firewall "
+                "is allowing Lentel to make outbound UDP connections.\n"
+                "On any OS: verify the machine has network access."
             )
         elif "No sender connected" in msg:
             friendly = (
