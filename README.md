@@ -1,6 +1,6 @@
 # Lentel
 
-**Send any file, any size, to anyone — no server, no port forwarding.**
+**Send any file or folder, any size, to anyone — no server, no port forwarding.**
 
 [![CI](https://github.com/MridulHarsh/lentel/actions/workflows/ci.yml/badge.svg)](https://github.com/MridulHarsh/lentel/actions/workflows/ci.yml)
 [![Release](https://github.com/MridulHarsh/lentel/actions/workflows/release.yml/badge.svg)](https://github.com/MridulHarsh/lentel/releases/latest)
@@ -59,7 +59,8 @@ The tray app runs in your **macOS menu bar** or **Windows system tray**:
 
 ```
   ↑ Send a file…          ← pick a file, get a ticket
-  ↓ Receive a file…       ← paste a ticket, get the file
+  ↑ Send a folder…        ← pick a folder, transferred as a tree (no zipping)
+  ↓ Receive…              ← paste a ticket, get the file or folder
   ──────────────────
   Active transfers ▸
     ↑ video.mkv  72%  45.2 MB/s
@@ -84,7 +85,7 @@ The icon lights up blue when a transfer is active.
 pip install lentel
 ```
 
-**Send:**
+**Send a file:**
 ```
 $ lentel send ./video.mkv
   Discovering public address…
@@ -95,6 +96,14 @@ share it with the receiver.
 waiting for peer...
 
  [####################----------] 65.0%  421.3 MB/612.0 MB  52.7 MB/s  eta 3s
+```
+
+**Send a folder** (transferred as a tree — no zipping):
+```
+$ lentel send ./my-project
+  preparing folder my-project (42.3 MB)
+  Discovering public address…
+ticket: bold-crab-fern-42@203.0.113.5:54321
 ```
 
 **Receive:**

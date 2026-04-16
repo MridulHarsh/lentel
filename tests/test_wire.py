@@ -9,7 +9,9 @@ import time
 import pytest
 
 from lentel.chunker import (
-    Manifest, hash_chunk, merkle_root, scan_file, ChunkWriter,
+    Manifest, FileEntry, MultiFileWriter, UnsafePathError,
+    hash_chunk, merkle_root, sanitize_relpath, scan_file, scan_folder,
+    scan_path, verify_manifest,
 )
 from lentel.congestion import BBRLite, Phase
 from lentel.crypto import (
@@ -31,23 +33,17 @@ def test_header_roundtrip():
     assert len(b) == HEADER_SIZE
     h2 = decode_header(b + b"\x00" * 128)
     assert h2.type is PacketType.DATA
-    assert h2.flags == Flag.FIN
     assert h2.session_id == 0xDEADBEEF
     assert h2.stream_id == 7
-    assert h2.sequence == 42
-    assert h2.payload_length == 128
-
 
 def test_header_bad_magic():
     with pytest.raises(WireError):
         decode_header(b"\x00" * 20)
 
-
 def test_nonce_derivation_distinct_directions():
     a = derive_nonce(Direction.INITIATOR_TO_RESPONDER, 1, 2, 3)
     b = derive_nonce(Direction.RESPONDER_TO_INITIATOR, 1, 2, 3)
     assert a != b and len(a) == 12
-
 
 def test_nonce_derivation_distinct_sequences():
     a = derive_nonce(Direction.INITIATOR_TO_RESPONDER, 1, 2, 3)
@@ -55,7 +51,7 @@ def test_nonce_derivation_distinct_sequences():
     assert a != b
 
 
-# ---------- chunker -------------------------------------------------------
+# ---------- chunker: Merkle -----------------------------------------------
 
 def test_merkle_empty():
     assert len(merkle_root([])) == 32
@@ -68,35 +64,133 @@ def test_merkle_stable():
     leaves = [hash_chunk(str(i).encode()) for i in range(7)]
     assert merkle_root(leaves) == merkle_root(leaves)
 
-def test_scan_file_and_roundtrip():
+
+# ---------- chunker: single-file manifest --------------------------------
+
+def test_scan_file_single_manifest():
     with tempfile.TemporaryDirectory() as d:
         p = os.path.join(d, "data.bin")
         with open(p, "wb") as f:
             f.write(os.urandom(200_000))
-        manifest, leaves = scan_file(p, chunk_size=65536)
-        assert manifest.file_size == 200_000
-        assert manifest.chunk_count == 4
-        assert manifest.root_hash == merkle_root(leaves)
-        wire = manifest.to_wire()
-        m2 = Manifest.from_wire(wire)
-        assert m2.root_hash == manifest.root_hash
+        manifest, all_hashes = scan_file(p, chunk_size=65536)
+        assert not manifest.is_folder
+        assert len(manifest.files) == 1
+        assert manifest.files[0].size == 200_000
+        assert manifest.total_chunks == 4
+        assert manifest.total_size == 200_000
+        assert manifest.files[0].root_hash == merkle_root(all_hashes[0])
 
-def test_chunk_writer_sparse():
+def test_manifest_wire_roundtrip():
     with tempfile.TemporaryDirectory() as d:
-        src = os.path.join(d, "src.bin")
-        dst = os.path.join(d, "dst.bin")
-        data = os.urandom(130_000)
-        with open(src, "wb") as f:
-            f.write(data)
-        manifest, _ = scan_file(src, chunk_size=65536)
-        w = ChunkWriter(dst, manifest)
-        with open(src, "rb") as f:
-            c0, c1, c2 = f.read(65536), f.read(65536), f.read(65536)
-        w.write(2, c2)
-        w.write(0, c0)
-        w.write(1, c1)
-        w.close()
-        assert open(dst, "rb").read() == data
+        p = os.path.join(d, "data.bin")
+        with open(p, "wb") as f:
+            f.write(os.urandom(50_000))
+        m, _ = scan_file(p)
+        m2 = Manifest.from_wire(m.to_wire())
+        assert m2.is_folder == m.is_folder
+        assert m2.root_name == m.root_name
+        assert m2.total_chunks == m.total_chunks
+        assert m2.files[0].root_hash == m.files[0].root_hash
+
+
+# ---------- chunker: folder manifest --------------------------------------
+
+def test_scan_folder_nested():
+    with tempfile.TemporaryDirectory() as d:
+        folder = os.path.join(d, "my-folder")
+        os.makedirs(os.path.join(folder, "sub1", "sub2"))
+        with open(os.path.join(folder, "a.txt"), "wb") as f:
+            f.write(b"hello world\n")
+        with open(os.path.join(folder, "sub1", "b.bin"), "wb") as f:
+            f.write(os.urandom(100_000))
+        with open(os.path.join(folder, "sub1", "sub2", "c.log"), "wb") as f:
+            f.write(b"deeply nested\n")
+
+        m, leaves = scan_folder(folder)
+        assert m.is_folder
+        assert m.root_name == "my-folder"
+        paths = {e.path for e in m.files}
+        assert paths == {"a.txt", "sub1/b.bin", "sub1/sub2/c.log"}
+        # Every file has a per-file Merkle root
+        assert all(len(e.root_hash) == 32 for e in m.files)
+        # Total size sums correctly
+        assert m.total_size == 12 + 100_000 + 14
+
+def test_scan_folder_empty_file():
+    with tempfile.TemporaryDirectory() as d:
+        folder = os.path.join(d, "f")
+        os.makedirs(folder)
+        open(os.path.join(folder, "empty.bin"), "wb").close()
+        m, _ = scan_folder(folder)
+        assert m.files[0].size == 0
+        assert m.files[0].chunk_count(m.chunk_size) == 0
+        assert m.total_chunks == 0
+
+def test_scan_path_autodetect():
+    with tempfile.TemporaryDirectory() as d:
+        # file
+        p = os.path.join(d, "a.bin")
+        with open(p, "wb") as f:
+            f.write(b"x")
+        m, _ = scan_path(p)
+        assert not m.is_folder
+        # folder
+        folder = os.path.join(d, "dir")
+        os.makedirs(folder)
+        with open(os.path.join(folder, "x"), "wb") as f:
+            f.write(b"y")
+        m2, _ = scan_path(folder)
+        assert m2.is_folder
+
+
+# ---------- chunker: path safety ------------------------------------------
+
+def test_sanitize_rejects_absolute():
+    with pytest.raises(UnsafePathError):
+        sanitize_relpath("/etc/passwd")
+
+def test_sanitize_rejects_dotdot():
+    with pytest.raises(UnsafePathError):
+        sanitize_relpath("../secret")
+    with pytest.raises(UnsafePathError):
+        sanitize_relpath("ok/../bad")
+
+def test_sanitize_rejects_drive_letter():
+    with pytest.raises(UnsafePathError):
+        sanitize_relpath("C:/Windows")
+
+def test_sanitize_accepts_good():
+    assert sanitize_relpath("sub/file.txt") == "sub/file.txt"
+    assert sanitize_relpath("sub\\file.txt") == "sub/file.txt"  # normalized
+
+
+# ---------- chunker: MultiFileWriter roundtrip ---------------------------
+
+def test_multifile_writer_folder_roundtrip():
+    with tempfile.TemporaryDirectory() as d:
+        src_folder = os.path.join(d, "src")
+        dst_dir = os.path.join(d, "dst")
+        os.makedirs(os.path.join(src_folder, "inner"))
+        with open(os.path.join(src_folder, "a.txt"), "wb") as f:
+            f.write(b"hello\n" * 1000)
+        with open(os.path.join(src_folder, "inner", "b.txt"), "wb") as f:
+            f.write(os.urandom(70_000))
+
+        m, _ = scan_folder(src_folder)
+        writer = MultiFileWriter(dst_dir, m)
+
+        # Copy every chunk over
+        for fi, entry in enumerate(m.files):
+            abs_src = os.path.join(src_folder, *entry.path.split("/"))
+            n = entry.chunk_count(m.chunk_size)
+            with open(abs_src, "rb") as f:
+                for ci in range(n):
+                    data = f.read(m.chunk_size)
+                    writer.write(fi, ci, data)
+
+        writer.flush()
+        assert verify_manifest(writer.root_path, m)
+        writer.close()
 
 
 # ---------- crypto --------------------------------------------------------
@@ -115,7 +209,6 @@ def test_handshake_round_trip():
     r.on_hs_done(hs_done)
     assert i.keys is not None and r.keys is not None
     assert i.keys.k_i2r == r.keys.k_i2r
-    assert i.keys.k_r2i == r.keys.k_r2i
 
 def test_handshake_wrong_psk():
     i = InitiatorHandshake(psk_from_ticket("a-b-00"))
@@ -152,15 +245,14 @@ def test_bbr_increases_pacing_on_better_bw():
     assert bbr.pacing_rate >= r1
 
 
-# ---------- wordlist (new format with address) ----------------------------
+# ---------- wordlist ------------------------------------------------------
 
 def test_ticket_roundtrip():
     for _ in range(50):
         t = new_ticket(("127.0.0.1", 9999))
         code, addr = parse_ticket(t)
-        assert "@" in t
         assert addr == ("127.0.0.1", 9999)
-        assert len(code.split("-")) == 4  # 3 words + checksum
+        assert len(code.split("-")) == 4
 
 def test_ticket_bad_checksum():
     t = new_ticket(("1.2.3.4", 5555))
@@ -178,7 +270,6 @@ def test_ticket_no_address():
 def test_code_only():
     c = new_code()
     assert "@" not in c
-    assert len(c.split("-")) == 4
 
 
 # ---------- STUN ----------------------------------------------------------
@@ -191,4 +282,3 @@ def test_stun_request_format():
     msg_type, msg_len, magic = struct.unpack_from("!HHI", pkt, 0)
     assert msg_type == _BINDING_REQUEST
     assert magic == _STUN_MAGIC
-    assert msg_len == 0

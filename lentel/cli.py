@@ -48,12 +48,27 @@ class ProgressBar:
 
 
 async def _cmd_send(args: argparse.Namespace) -> int:
-    path = args.file
+    path = args.path
     if not os.path.exists(path):
         print(f"error: {path} does not exist", file=sys.stderr)
         return 1
-    size = os.path.getsize(path)
-    print(f"preparing {os.path.basename(path)} ({_humanbytes(size)})")
+    if os.path.isdir(path):
+        # Sum up all files in the tree for the progress total.
+        size = 0
+        for dp, _, fn in os.walk(path, followlinks=False):
+            for f in fn:
+                fp = os.path.join(dp, f)
+                if os.path.isfile(fp) and not os.path.islink(fp):
+                    size += os.path.getsize(fp)
+        kind = "folder"
+    elif os.path.isfile(path):
+        size = os.path.getsize(path)
+        kind = "file"
+    else:
+        print(f"error: {path} is not a file or folder", file=sys.stderr)
+        return 1
+    print(f"preparing {kind} {os.path.basename(path.rstrip(os.sep)) or path} "
+          f"({_humanbytes(size)})")
 
     def on_ticket(t: str) -> None:
         print(f"\nticket: {t}")
@@ -122,12 +137,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    ps = sub.add_parser("send", help="send a file")
-    ps.add_argument("file", help="path to the file to send")
+    ps = sub.add_parser("send", help="send a file or folder")
+    ps.add_argument("path", help="path to the file or folder to send")
     ps.add_argument("--timeout", type=float, default=300.0,
                     help="seconds to wait for a receiver (default 300)")
 
-    pr = sub.add_parser("recv", help="receive a file by ticket")
+    pr = sub.add_parser("recv", help="receive a file or folder by ticket")
     pr.add_argument("ticket", help="ticket from the sender (includes @address)")
     pr.add_argument("--out", default=".", help="destination directory")
     pr.add_argument("--overwrite", action="store_true")

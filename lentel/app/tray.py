@@ -46,6 +46,22 @@ def _humanbytes(n: float) -> str:
     return f"{n:.1f} TB"
 
 
+def _path_total_size(path: str) -> int:
+    """Sum all file sizes at or under ``path``. Folders are walked recursively."""
+    if os.path.isfile(path):
+        return os.path.getsize(path)
+    total = 0
+    for dirpath, _, filenames in os.walk(path, followlinks=False):
+        for fname in filenames:
+            fp = os.path.join(dirpath, fname)
+            try:
+                if os.path.isfile(fp) and not os.path.islink(fp):
+                    total += os.path.getsize(fp)
+            except OSError:
+                pass
+    return total
+
+
 def _fmt_transfer(t: Transfer) -> str:
     arrow = "\u2191" if t.kind == "send" else "\u2193"
     st = t.status
@@ -106,8 +122,9 @@ class TrayApp:
 
     def _build_menu(self) -> Menu:
         items: list[MenuItem] = [
-            MenuItem("Send a file\u2026",    self._bg(self._on_send)),
-            MenuItem("Receive a file\u2026", self._bg(self._on_recv)),
+            MenuItem("Send a file\u2026",    self._bg(self._on_send_file)),
+            MenuItem("Send a folder\u2026",  self._bg(self._on_send_folder)),
+            MenuItem("Receive\u2026",        self._bg(self._on_recv)),
             Menu.SEPARATOR,
         ]
 
@@ -165,16 +182,24 @@ class TrayApp:
     #      wait for peer → handshake → transfer → done/error
     #
 
-    def _on_send(self, icon, item) -> None:
+    def _on_send_file(self, icon, item) -> None:
         path = pick_file("Send a file with Lentel")
         if not path:
             return
+        self._start_send(path)
 
-        file_name = os.path.basename(path)
-        file_size = os.path.getsize(path)
+    def _on_send_folder(self, icon, item) -> None:
+        path = pick_directory("Send a folder with Lentel")
+        if not path:
+            return
+        self._start_send(path)
 
-        transfer = self.state.new_transfer("send", file_name)
-        self.state.update(transfer, size=file_size, status="discovering address\u2026")
+    def _start_send(self, path: str) -> None:
+        name = os.path.basename(path.rstrip(os.sep)) or path
+        size = _path_total_size(path)
+
+        transfer = self.state.new_transfer("send", name)
+        self.state.update(transfer, size=size, status="discovering address\u2026")
         self._refresh()
 
         self.runner.submit(self._run_send(transfer, path))

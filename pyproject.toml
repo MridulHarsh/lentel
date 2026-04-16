@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lentel"
-version = "1.0.0"
-description = "A new UDP-based protocol for fast, NAT-free file transfer of any size."
+version = "1.0.1"
+description = "Send any file or folder, any size, to anyone — no server, no port forwarding."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Apache-2.0" }

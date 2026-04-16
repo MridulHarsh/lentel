@@ -158,17 +158,20 @@ async def send_file(
     **_kw,  # accept & ignore coordinator= for compat
 ) -> str:
     """
-    Send a file.  No server required.
+    Send a file **or a folder**.  No server required.
 
-    1. Discovers public address via STUN / UPnP.
-    2. Generates a ticket embedding that address.
-    3. Fires ``on_ticket(ticket)`` so the UI can show it.
-    4. Waits for the receiver to connect (up to ``wait_timeout`` seconds).
-    5. Runs the encrypted transfer.
-    6. Returns the ticket string on success.
+    1. Auto-detects whether ``path`` is a single file or a directory tree.
+    2. Discovers public address via STUN / UPnP.
+    3. Generates a ticket embedding that address.
+    4. Fires ``on_ticket(ticket)`` so the UI can show it.
+    5. Waits for the receiver to connect (up to ``wait_timeout`` seconds).
+    6. Runs the encrypted transfer (multi-file manifest for folders).
+    7. Returns the ticket string on success.
     """
     if not os.path.exists(path):
         raise FileNotFoundError(path)
+    if not (os.path.isfile(path) or os.path.isdir(path)):
+        raise ValueError(f"path is not a file or folder: {path}")
 
     def _status(msg: str) -> None:
         if on_status:
@@ -249,13 +252,13 @@ async def recv_file(
     **_kw,  # accept & ignore coordinator= for compat
 ) -> str:
     """
-    Receive a file by ticket.  No server required.
+    Receive a file **or a folder** by ticket.  No server required.
 
     1. Parses the sender's address from the ticket.
     2. Sends PUNCH packets to the sender.
     3. Completes the handshake.
-    4. Receives + verifies the file.
-    5. Returns the local path of the received file.
+    4. Receives + verifies the payload (single file OR a whole directory tree).
+    5. Returns the local path of the received file or the created folder.
     """
     def _status(msg: str) -> None:
         if on_status:
@@ -298,3 +301,8 @@ async def recv_file(
             pass
 
     return out
+
+
+# Convenience alias — semantically identical, reads better in code that
+# explicitly wants a folder.
+send_folder = send_file
