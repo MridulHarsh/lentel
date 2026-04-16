@@ -98,14 +98,15 @@ jobs:
 
       - name: Create DMG with an unquarantined install helper
         run: |
+          rm -rf dmg-staging
           mkdir -p dmg-staging
           cp -R dist/Lentel.app dmg-staging/
           ln -s /Applications dmg-staging/Applications
 
-          # Drop in a tiny shell script users can run if Gatekeeper blocks
-          # the app with the misleading "is damaged and can't be opened"
-          # error.  This just strips the quarantine attribute.
-          cat > dmg-staging/"Fix 'damaged app' error.command" <<'EOS'
+          # A tiny shell script users can run if Gatekeeper blocks the app
+          # with the misleading "is damaged and can't be opened" error.
+          # Filename has no special characters — hdiutil dislikes quotes.
+          cat > "dmg-staging/Fix damaged app error.command" <<'EOS'
           #!/usr/bin/env bash
           echo "Stripping Gatekeeper quarantine from Lentel.app..."
           for p in /Applications/Lentel.app ~/Applications/Lentel.app \
@@ -118,12 +119,26 @@ jobs:
           echo "Press return to close this window."
           read
           EOS
-          chmod +x dmg-staging/"Fix 'damaged app' error.command"
+          chmod +x "dmg-staging/Fix damaged app error.command"
 
-          hdiutil create -volname "Lentel" \
-            -srcfolder dmg-staging \
-            -ov -format UDZO \
-            "Lentel-macOS.dmg"
+          # Let macOS finish flushing codesign writes before hdiutil tries
+          # to snapshot the directory — fixes intermittent "Resource busy".
+          sync
+          sleep 2
+
+          # Retry hdiutil up to 3 times in case the first call races with
+          # a lingering file lock (e.g. Spotlight scanning the new binary).
+          for attempt in 1 2 3; do
+            if hdiutil create -volname "Lentel" \
+                -srcfolder dmg-staging \
+                -ov -format UDZO \
+                -fs HFS+ \
+                "Lentel-macOS.dmg"; then
+              break
+            fi
+            echo "hdiutil attempt $attempt failed, retrying..."
+            sleep 3
+          done
           ls -lh Lentel-macOS.dmg
 
       - name: Upload macOS artifact
