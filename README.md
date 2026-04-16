@@ -24,6 +24,23 @@ receiver connects directly.
 | **Windows** | [Lentel.exe](https://github.com/MridulHarsh/lentel/releases/latest/download/Lentel.exe) | Single file. Run it — appears in the system tray. |
 | **Any OS (pip)** | `pip install lentel` | CLI + Python API. Add `[tray]` for the GUI. |
 
+### macOS: "Lentel is damaged and can't be opened"
+
+This is **not** actually a damaged app. Apple's Gatekeeper shows this
+error for any app that isn't signed with a paid ($99/year) Apple
+Developer certificate — every open-source Mac app distributed outside
+the App Store hits this. Two ways to fix it:
+
+1. **Use the included helper**: after opening the DMG, double-click
+   **`Fix 'damaged app' error.command`**. It runs a one-line command that
+   strips the quarantine attribute. Then launch Lentel normally.
+
+2. **Or run it yourself** in Terminal:
+   ```bash
+   xattr -cr /Applications/Lentel.app
+   ```
+   Then launch Lentel normally. You only need to do this once.
+
 ## How it works
 
 ```

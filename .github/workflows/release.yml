@@ -86,12 +86,40 @@ jobs:
           /usr/libexec/PlistBuddy -c "Set :LSUIElement true"       "$PLIST"
           /usr/libexec/PlistBuddy -c "Add :NSHighResolutionCapable bool true" "$PLIST" 2>/dev/null || true
 
-      - name: Create DMG
+      - name: Ad-hoc code-sign the bundle
         run: |
-          # Create a drag-to-install DMG with Applications shortcut
+          # Without a paid Apple Developer certificate we can't notarise,
+          # but an ad-hoc signature at least satisfies the Apple Silicon
+          # runtime loader and gives users a cleaner error message if
+          # Gatekeeper intervenes.  Users still need to either right-click →
+          # Open on first launch, OR run: xattr -cr /Applications/Lentel.app
+          codesign --force --deep --sign - dist/Lentel.app
+          codesign --verify --verbose dist/Lentel.app || true
+
+      - name: Create DMG with an unquarantined install helper
+        run: |
           mkdir -p dmg-staging
           cp -R dist/Lentel.app dmg-staging/
           ln -s /Applications dmg-staging/Applications
+
+          # Drop in a tiny shell script users can run if Gatekeeper blocks
+          # the app with the misleading "is damaged and can't be opened"
+          # error.  This just strips the quarantine attribute.
+          cat > dmg-staging/"Fix 'damaged app' error.command" <<'EOS'
+          #!/usr/bin/env bash
+          echo "Stripping Gatekeeper quarantine from Lentel.app..."
+          for p in /Applications/Lentel.app ~/Applications/Lentel.app \
+                   ~/Downloads/Lentel.app "$HOME/Desktop/Lentel.app"; do
+            if [ -d "$p" ]; then
+              xattr -cr "$p" && echo "  done: $p"
+            fi
+          done
+          echo "You can now double-click Lentel to launch it."
+          echo "Press return to close this window."
+          read
+          EOS
+          chmod +x dmg-staging/"Fix 'damaged app' error.command"
+
           hdiutil create -volname "Lentel" \
             -srcfolder dmg-staging \
             -ov -format UDZO \
@@ -198,24 +226,40 @@ jobs:
           body: |
             ## Lentel ${{ github.ref_name }}
 
-            Send any file, any size, to anyone — **no server, no port forwarding**.
+            Send any file or folder, any size, to anyone — **no server, no port forwarding**.
 
             ### Downloads
 
-            | Platform | File | Notes |
-            |----------|------|-------|
+            | Platform | File | Install |
+            |----------|------|---------|
             | **macOS** | `Lentel-macOS.dmg` | Open DMG → drag Lentel to Applications |
-            | **Windows** | `Lentel.exe` | Single file, run directly or add to Startup |
+            | **Windows** | `Lentel.exe` | Single file — run directly, or add to Startup |
+
+            ### macOS — "Lentel is damaged and can't be opened"
+
+            This is **not** actually a damaged app. Apple's Gatekeeper shows
+            this message for any app not signed with a $99/year Apple
+            Developer certificate. Two ways to fix it:
+
+            **Option 1 — double-click the included helper** (simplest)
+            After opening the DMG, double-click **`Fix 'damaged app' error.command`**.
+            It runs a one-line command that strips the quarantine flag.
+
+            **Option 2 — run the command yourself**
+            ```bash
+            xattr -cr /Applications/Lentel.app
+            ```
+            Then launch Lentel normally.
 
             ### How it works
 
-            1. **Sender** clicks "Send a file" → picks a file → gets a ticket like `bold-crab-fern-42@203.0.113.5:54321`
-            2. **Receiver** clicks "Receive a file" → pastes the ticket → file transfers directly, peer-to-peer
-            3. No server. No account. No port forwarding. The sender's address is discovered automatically via STUN/UPnP.
+            1. **Sender** clicks "Send a file" (or "Send a folder") → picks it → gets a ticket like `bold-crab-fern-42@203.0.113.5:54321`
+            2. **Receiver** clicks "Receive" → pastes the ticket → file/folder transfers directly, peer-to-peer
+            3. No server. No account. No port forwarding. The sender's public address is discovered automatically via STUN/UPnP.
 
             ### What's new
 
-            See [CHANGELOG](https://github.com/${{ github.repository }}/commits/${{ github.ref_name }}) for details.
+            See [commits since last tag](https://github.com/${{ github.repository }}/commits/${{ github.ref_name }}) for details.
           draft: false
           prerelease: ${{ contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}
           files: |

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lentel"
-version = "1.0.2"
+version = "1.0.3"
 description = "Send any file or folder, any size, to anyone — no server, no port forwarding."
 readme = "README.md"
 requires-python = ">=3.11"
