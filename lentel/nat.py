@@ -323,6 +323,105 @@ class UPnPMapping:
             self._ctrl = None
 
 
+# ---------- Relay mode (optional fallback for restrictive NATs) -----------
+
+RELAY_MAGIC = b"LNTLRLY\x00"
+RELAY_TOKEN_LEN = 16
+
+
+async def relay_register(
+    sock: socket.socket,
+    relay_addr: tuple[str, int],
+    token: bytes,
+    paired_timeout: float = 300.0,
+    probe_interval: float = 1.0,
+) -> None:
+    """Register with a relay server and wait until the peer also connects.
+
+    The relay pairs the two peers by ``token`` (16 bytes derived from the
+    ticket PSK).  Once both peers have registered, the relay sends a
+    ``LNTLRLY\\x00 + token + 0xFF`` ACK to each.  We keep sending
+    registration probes every ``probe_interval`` seconds because the NAT
+    mapping to the relay needs to stay warm, and because UDP packets can be
+    dropped.
+
+    Raises NATError on timeout or if the relay can't be reached at all.
+    """
+    if len(token) != RELAY_TOKEN_LEN:
+        raise ValueError(f"token must be {RELAY_TOKEN_LEN} bytes")
+
+    loop = asyncio.get_event_loop()
+    pkt = RELAY_MAGIC + token
+    deadline = time.monotonic() + paired_timeout
+    first_ack = False
+
+    while time.monotonic() < deadline:
+        try:
+            await loop.sock_sendto(sock, pkt, relay_addr)
+        except OSError as e:
+            raise NATError(f"Could not reach relay at {relay_addr}: {e}") from e
+
+        try:
+            data, src = await asyncio.wait_for(
+                loop.sock_recvfrom(sock, 2048), timeout=probe_interval,
+            )
+        except asyncio.TimeoutError:
+            continue
+        except OSError:
+            continue
+
+        # Accept replies only from the relay.
+        if src != relay_addr:
+            # Stray packet — could be a direct PUNCH from the peer if our
+            # NAT actually allowed it through.  Ignore for now; the caller
+            # will do its own handshake next.
+            continue
+
+        if not data.startswith(RELAY_MAGIC):
+            continue
+        if len(data) < len(RELAY_MAGIC) + RELAY_TOKEN_LEN + 1:
+            continue
+        if data[len(RELAY_MAGIC):len(RELAY_MAGIC) + RELAY_TOKEN_LEN] != token:
+            continue
+
+        flag = data[len(RELAY_MAGIC) + RELAY_TOKEN_LEN]
+        if flag == 0xFF:
+            # Relay confirms: both peers registered.  We're paired.
+            return
+        if flag == 0x00:
+            # Registered but peer hasn't arrived yet.  Keep probing.
+            first_ack = True
+            continue
+
+    if first_ack:
+        raise NATError(
+            "Connected to relay but the other peer never showed up.\n"
+            "Make sure they are using the same ticket."
+        )
+    raise NATError(
+        f"Could not reach the relay at {relay_addr[0]}:{relay_addr[1]}.\n"
+        "Check the relay URL and your internet connection."
+    )
+
+
+def parse_relay_url(url: str) -> tuple[str, int]:
+    """Parse ``host:port``, ``udp://host:port``, etc. into a (host, port) tuple."""
+    s = url.strip()
+    if "://" in s:
+        s = s.split("://", 1)[1]
+    s = s.rstrip("/")
+    if ":" not in s:
+        raise ValueError(f"relay URL must include a port: {url!r}")
+    host, port_s = s.rsplit(":", 1)
+    try:
+        port = int(port_s)
+    except ValueError:
+        raise ValueError(f"bad relay port: {port_s!r}")
+    if port < 1 or port > 65535:
+        raise ValueError(f"relay port out of range: {port}")
+    return host, port
+
+
 # ---------- Sender: discover address + wait for peer ----------------------
 
 PUNCH_MAGIC = b"LNTLPUNCH"

@@ -21,7 +21,9 @@ from lentel.wire import (
     HEADER_SIZE, Direction, Flag, Header, PacketType, WireError,
     decode_header, derive_nonce, encode_header,
 )
-from lentel.wordlist import new_ticket, parse_ticket, new_code
+from lentel.wordlist import (
+    new_code, new_ticket, parse_ticket, psk_to_relay_token,
+)
 
 
 # ---------- wire ----------------------------------------------------------
@@ -247,12 +249,20 @@ def test_bbr_increases_pacing_on_better_bw():
 
 # ---------- wordlist ------------------------------------------------------
 
-def test_ticket_roundtrip():
+def test_ticket_direct_roundtrip():
     for _ in range(50):
         t = new_ticket(("127.0.0.1", 9999))
-        code, addr = parse_ticket(t)
+        code, addr, via_relay = parse_ticket(t)
         assert addr == ("127.0.0.1", 9999)
+        assert via_relay is False
         assert len(code.split("-")) == 4
+
+def test_ticket_relay_roundtrip():
+    t = new_ticket(("relay.example.com", 7778), via_relay=True)
+    assert "@r:" in t
+    code, addr, via_relay = parse_ticket(t)
+    assert addr == ("relay.example.com", 7778)
+    assert via_relay is True
 
 def test_ticket_bad_checksum():
     t = new_ticket(("1.2.3.4", 5555))
@@ -270,6 +280,34 @@ def test_ticket_no_address():
 def test_code_only():
     c = new_code()
     assert "@" not in c
+
+def test_relay_token_determinism():
+    from lentel.crypto import psk_from_ticket
+    psk = psk_from_ticket("bold-crab-fern-42")
+    assert psk_to_relay_token(psk) == psk_to_relay_token(psk)
+    assert len(psk_to_relay_token(psk)) == 16
+    # Different PSK → different token
+    psk2 = psk_from_ticket("bold-crab-fern-43")
+    assert psk_to_relay_token(psk) != psk_to_relay_token(psk2)
+
+
+# ---------- Relay URL parsing ---------------------------------------------
+
+def test_parse_relay_url():
+    from lentel.nat import parse_relay_url
+    assert parse_relay_url("host:7778") == ("host", 7778)
+    assert parse_relay_url("relay.example.com:1234") == ("relay.example.com", 1234)
+    assert parse_relay_url("udp://host:7778") == ("host", 7778)
+    assert parse_relay_url("host:7778/") == ("host", 7778)
+
+def test_parse_relay_url_bad():
+    from lentel.nat import parse_relay_url
+    with pytest.raises(ValueError):
+        parse_relay_url("host")
+    with pytest.raises(ValueError):
+        parse_relay_url("host:abc")
+    with pytest.raises(ValueError):
+        parse_relay_url("host:99999")
 
 
 # ---------- STUN ----------------------------------------------------------

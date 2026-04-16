@@ -87,6 +87,7 @@ async def _cmd_send(args: argparse.Namespace) -> int:
             on_ticket=on_ticket,
             on_status=on_status,
             wait_timeout=args.timeout,
+            relay=args.relay,
         )
     except Exception as e:
         print(f"\nsend failed: {e}", file=sys.stderr)
@@ -141,6 +142,8 @@ def main(argv: list[str] | None = None) -> int:
     ps.add_argument("path", help="path to the file or folder to send")
     ps.add_argument("--timeout", type=float, default=300.0,
                     help="seconds to wait for a receiver (default 300)")
+    ps.add_argument("--relay", default=None, metavar="HOST:PORT",
+                    help="route through a relay (use when direct P2P fails)")
 
     pr = sub.add_parser("recv", help="receive a file or folder by ticket")
     pr.add_argument("ticket", help="ticket from the sender (includes @address)")

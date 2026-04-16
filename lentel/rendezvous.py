@@ -1,23 +1,27 @@
 """
-Coordinator-free peer-to-peer rendezvous.
+Peer-to-peer rendezvous.
 
 Public API:
-    ticket = await send_file(path, on_ticket=..., progress=...)
-    path   = await recv_file(ticket, dest_dir=..., progress=...)
+    ticket = await send_file(path, on_ticket=..., progress=..., relay=None)
+    path   = await recv_file(ticket, dest_dir=..., progress=..., relay=None)
 
-The sender discovers its public address via STUN/UPnP, embeds it in the
-ticket, and waits for the receiver's PUNCH.  The receiver parses the
-address from the ticket and connects directly.  No server of any kind is
-required.
+**Default (direct) mode**: the sender discovers its public address via
+STUN/UPnP, embeds it in the ticket, and waits for the receiver's PUNCH.
+The receiver parses the address from the ticket and connects directly.
+No server is involved.  Works when at least one side's NAT is cone-type.
 
-An optional ``coordinator`` parameter is still accepted for backward
-compatibility; if provided, the legacy coordinator-based flow is used.
+**Relay mode**: if the sender passes ``relay="host:port"``, the ticket
+encodes the relay's address instead of the sender's.  Both peers connect
+to the relay, which forwards opaque UDP datagrams between them.  The
+relay never sees plaintext (the AEAD keys are derived from the ticket
+PSK and never leave either peer).  This works on any NAT type.  Run
+your own relay with ``lentel-relay --bind 0.0.0.0:7778``.
 """
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
-import secrets
 import socket
 from typing import Callable, Optional
 
@@ -26,15 +30,18 @@ from .crypto import (
     psk_from_ticket,
 )
 from .nat import (
-    NATError, discover_public_address, receiver_punch, sender_wait_for_peer,
+    NATError, RELAY_MAGIC, RELAY_TOKEN_LEN, discover_public_address,
+    parse_relay_url, receiver_punch, relay_register, sender_wait_for_peer,
 )
 from .session import RecvSession, SendSession, DEFAULT_PARALLEL_STREAMS
 from .transport import Session, _Proto
 from .wire import HEADER_SIZE, PacketType, decode_header
-from .wordlist import new_ticket as _gen_ticket, parse_ticket
+from .wordlist import (
+    new_code, new_ticket as _gen_ticket, parse_ticket, psk_to_relay_token,
+)
 
 
-# ---------- helpers -------------------------------------------------------
+# ---------- socket + handshake helpers ------------------------------------
 
 async def _make_socket(bind_addr: str = "0.0.0.0", bind_port: int = 0) -> socket.socket:
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -47,6 +54,11 @@ async def _make_socket(bind_addr: str = "0.0.0.0", bind_port: int = 0) -> socket
     except OSError:
         pass
     return sock
+
+
+def _is_relay_stray(data: bytes) -> bool:
+    """A stray relay registration-ACK packet arriving during handshake."""
+    return data.startswith(RELAY_MAGIC)
 
 
 async def _do_handshake_initiator(
@@ -65,6 +77,8 @@ async def _do_handshake_initiator(
         except asyncio.TimeoutError:
             continue
         if src != peer:
+            continue
+        if _is_relay_stray(data):
             continue
         try:
             h = decode_header(data)
@@ -98,6 +112,8 @@ async def _do_handshake_responder(
             continue
         if src != peer:
             continue
+        if _is_relay_stray(data):
+            continue
         try:
             h = decode_header(data)
         except Exception:
@@ -117,6 +133,8 @@ async def _do_handshake_responder(
         except asyncio.TimeoutError:
             continue
         if src != peer:
+            continue
+        if _is_relay_stray(data):
             continue
         try:
             h = decode_header(data)
@@ -145,6 +163,19 @@ async def _wrap_socket(
     return session
 
 
+async def _resolve_host(host: str) -> str:
+    """Best-effort DNS resolution to an IPv4 address."""
+    loop = asyncio.get_event_loop()
+    try:
+        infos = await loop.getaddrinfo(host, 0, type=socket.SOCK_DGRAM,
+                                       family=socket.AF_INET)
+        if infos:
+            return infos[0][4][0]
+    except socket.gaierror:
+        pass
+    return host  # may already be an IP literal
+
+
 # ---------- public API ----------------------------------------------------
 
 async def send_file(
@@ -155,18 +186,14 @@ async def send_file(
     on_ticket: Optional[Callable[[str], None]] = None,
     on_status: Optional[Callable[[str], None]] = None,
     wait_timeout: float = 300.0,
-    **_kw,  # accept & ignore coordinator= for compat
+    relay: Optional[str] = None,
+    **_kw,
 ) -> str:
-    """
-    Send a file **or a folder**.  No server required.
+    """Send a file or folder.  Returns the ticket on success.
 
-    1. Auto-detects whether ``path`` is a single file or a directory tree.
-    2. Discovers public address via STUN / UPnP.
-    3. Generates a ticket embedding that address.
-    4. Fires ``on_ticket(ticket)`` so the UI can show it.
-    5. Waits for the receiver to connect (up to ``wait_timeout`` seconds).
-    6. Runs the encrypted transfer (multi-file manifest for folders).
-    7. Returns the ticket string on success.
+    If ``relay`` is a ``host:port`` string, the transfer goes through that
+    relay (required when your NAT blocks incoming connections).  The relay
+    never sees plaintext.
     """
     if not os.path.exists(path):
         raise FileNotFoundError(path)
@@ -177,54 +204,51 @@ async def send_file(
         if on_status:
             on_status(msg)
 
-    # If a full ticket (with @IP:PORT) was pre-supplied, bind to that port
-    # so the address in the ticket matches our actual socket.
+    # ---- relay mode -----------------------------------------------------
+    if relay:
+        return await _send_via_relay(
+            path, relay, ticket, parallel, progress,
+            on_ticket, _status, wait_timeout,
+        )
+
+    # ---- direct mode ----------------------------------------------------
     bind_port = 0
     if ticket and "@" in ticket:
         try:
-            _, (_, p) = parse_ticket(ticket)
+            _, (_, p), _ = parse_ticket(ticket)
             bind_port = p
-        except (ValueError, Exception):
+        except Exception:
             pass
 
     sock = await _make_socket(bind_port=bind_port)
     try:
         if ticket and "@" in ticket:
-            # Full ticket already has address — skip STUN discovery.
             pass
         else:
-            # 1. Discover our public address.
             _status("Discovering public address\u2026")
             pub_ip, pub_port, method = await discover_public_address(sock)
             _status(f"Public address: {pub_ip}:{pub_port} ({method})")
-
-            # 2. Build ticket.
             if ticket:
-                # Code-only ticket provided; append our address.
                 ticket = f"{ticket}@{pub_ip}:{pub_port}"
             else:
                 ticket = _gen_ticket((pub_ip, pub_port))
 
-        psk = psk_from_ticket(ticket.split("@")[0])
+        code, _addr, _relay_flag = parse_ticket(ticket)
+        psk = psk_from_ticket(code)
 
         if on_ticket:
             on_ticket(ticket)
 
-        # 3. Derive a cookie for the PUNCH exchange.
-        import hashlib
         cookie = hashlib.blake2b(
             b"lentel/v1/cookie\x00" + psk, digest_size=16,
         ).digest()
 
-        # 4. Wait for receiver's PUNCH.
         _status("Waiting for receiver\u2026")
         peer = await sender_wait_for_peer(sock, cookie, timeout=wait_timeout)
         _status("Receiver connected \u2014 handshaking\u2026")
 
-        # 5. Handshake (sender = initiator).
         keys = await _do_handshake_initiator(sock, peer, psk)
 
-        # 6. Transfer.
         _status("Transferring\u2026")
         session = await _wrap_socket(sock, keys, True, peer)
         try:
@@ -242,6 +266,54 @@ async def send_file(
     return ticket
 
 
+async def _send_via_relay(
+    path: str,
+    relay_url: str,
+    ticket: Optional[str],
+    parallel: int,
+    progress: Optional[Callable],
+    on_ticket: Optional[Callable[[str], None]],
+    _status: Callable[[str], None],
+    wait_timeout: float,
+) -> str:
+    relay_host, relay_port = parse_relay_url(relay_url)
+    _status(f"Resolving relay {relay_host}\u2026")
+    relay_ip = await _resolve_host(relay_host)
+    relay_addr = (relay_ip, relay_port)
+
+    code = ticket.split("@")[0] if (ticket and "@" in ticket) else (ticket or new_code())
+    # Build ticket with relay address baked in.
+    ticket = f"{code}@r:{relay_host}:{relay_port}"
+    psk = psk_from_ticket(code)
+    token = psk_to_relay_token(psk)
+
+    if on_ticket:
+        on_ticket(ticket)
+
+    sock = await _make_socket()
+    try:
+        _status(f"Registering with relay at {relay_host}:{relay_port}\u2026")
+        await relay_register(sock, relay_addr, token, paired_timeout=wait_timeout)
+        _status("Receiver connected via relay \u2014 handshaking\u2026")
+
+        keys = await _do_handshake_initiator(sock, relay_addr, psk)
+
+        _status("Transferring (via relay)\u2026")
+        session = await _wrap_socket(sock, keys, True, relay_addr)
+        try:
+            sender = SendSession(session, path, parallel=parallel, progress=progress)
+            await sender.run()
+        finally:
+            await session.close()
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+    return ticket
+
+
 async def recv_file(
     ticket: str,
     dest_dir: str = ".",
@@ -249,42 +321,42 @@ async def recv_file(
     progress: Optional[Callable] = None,
     overwrite: bool = False,
     on_status: Optional[Callable[[str], None]] = None,
-    **_kw,  # accept & ignore coordinator= for compat
+    **_kw,
 ) -> str:
-    """
-    Receive a file **or a folder** by ticket.  No server required.
+    """Receive a file or folder by ticket.
 
-    1. Parses the sender's address from the ticket.
-    2. Sends PUNCH packets to the sender.
-    3. Completes the handshake.
-    4. Receives + verifies the payload (single file OR a whole directory tree).
-    5. Returns the local path of the received file or the created folder.
+    Relay mode is auto-detected from the ticket — no extra flag needed.
     """
     def _status(msg: str) -> None:
         if on_status:
             on_status(msg)
 
-    code, peer_addr = parse_ticket(ticket)
+    code, peer_host_port, via_relay = parse_ticket(ticket)
     psk = psk_from_ticket(code)
 
-    import hashlib
-    cookie = hashlib.blake2b(
-        b"lentel/v1/cookie\x00" + psk, digest_size=16,
-    ).digest()
+    _status(f"Resolving {peer_host_port[0]}\u2026")
+    peer_ip = await _resolve_host(peer_host_port[0])
+    peer_addr = (peer_ip, peer_host_port[1])
 
     sock = await _make_socket()
     try:
-        # 1. Connect to sender.
-        _status("Connecting to sender\u2026")
-        peer = await receiver_punch(sock, peer_addr, cookie)
-        _status("Connected \u2014 handshaking\u2026")
+        if via_relay:
+            token = psk_to_relay_token(psk)
+            _status(f"Registering with relay at {peer_host_port[0]}:{peer_host_port[1]}\u2026")
+            await relay_register(sock, peer_addr, token, paired_timeout=60.0)
+            _status("Paired via relay \u2014 handshaking\u2026")
+        else:
+            cookie = hashlib.blake2b(
+                b"lentel/v1/cookie\x00" + psk, digest_size=16,
+            ).digest()
+            _status("Connecting to sender\u2026")
+            peer_addr = await receiver_punch(sock, peer_addr, cookie)
+            _status("Connected \u2014 handshaking\u2026")
 
-        # 2. Handshake (receiver = responder).
-        keys = await _do_handshake_responder(sock, peer, psk)
+        keys = await _do_handshake_responder(sock, peer_addr, psk)
 
-        # 3. Receive.
         _status("Receiving\u2026")
-        session = await _wrap_socket(sock, keys, False, peer)
+        session = await _wrap_socket(sock, keys, False, peer_addr)
         try:
             recv = RecvSession(
                 session, dest_dir, parallel=parallel,
@@ -303,6 +375,5 @@ async def recv_file(
     return out
 
 
-# Convenience alias — semantically identical, reads better in code that
-# explicitly wants a folder.
+# Convenience alias.
 send_folder = send_file

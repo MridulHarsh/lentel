@@ -29,7 +29,7 @@ except Exception as e:  # pragma: no cover
 
 from lentel import recv_file, send_file
 from lentel.app.dialogs import (
-    ask_parallel, ask_ticket, copy_to_clipboard, error, info,
+    ask_parallel, ask_relay, ask_ticket, copy_to_clipboard, error, info,
     pick_directory, pick_file, reveal_in_file_manager,
 )
 from lentel.app.icon import make_icon
@@ -163,12 +163,15 @@ class TrayApp:
         return Menu(*items)
 
     def _settings_menu(self) -> Menu:
+        relay = self.state.config.relay_url
+        relay_label = f"Relay: {relay}" if relay else "Relay: (direct P2P)"
         return Menu(
             MenuItem("Downloads folder\u2026", self._bg(self._on_set_download_dir)),
             MenuItem(
                 f"Parallel streams: {self.state.config.parallel}",
                 self._bg(self._on_set_parallel),
             ),
+            MenuItem(relay_label, self._bg(self._on_set_relay)),
         )
 
     # ---- send flow -------------------------------------------------------
@@ -238,6 +241,7 @@ class TrayApp:
                 progress=progress,
                 on_ticket=on_ticket,
                 on_status=on_status,
+                relay=self.state.config.relay_url or None,
             )
             self.state.update(transfer, status="done",
                               bytes_done=transfer.size or 0)
@@ -364,6 +368,12 @@ class TrayApp:
         n = ask_parallel(self.state.config.parallel)
         if n:
             self.state.set_parallel(int(n))
+
+    def _on_set_relay(self, icon, item) -> None:
+        new = ask_relay(self.state.config.relay_url)
+        if new is None:
+            return  # user cancelled
+        self.state.set_relay_url(new.strip())
 
     # ---- utility callbacks -----------------------------------------------
 

@@ -185,6 +185,44 @@ Lentel discovers the sender's reachable address automatically:
 The discovered address is embedded in the ticket. The receiver connects
 directly — no middleman.
 
+### When direct P2P doesn't work: use a relay
+
+Some networks (symmetric NATs, some corporate / mobile / hotel Wi-Fi)
+strip incoming connections entirely. If you see the error
+**"Could not reach the sender. Their NAT may block incoming connections"**,
+switch to **relay mode**:
+
+1. **Run a relay** on any machine with a public IP — a $4 VPS is plenty,
+   the relay uses ~zero CPU and only pushes the bytes of the transfer:
+
+   ```bash
+   pip install lentel
+   lentel-relay --bind 0.0.0.0:7778
+   ```
+
+   Make sure UDP port `7778` is open in the VPS firewall.
+
+2. **Configure the app** (macOS / Windows tray): open the tray icon →
+   **Settings → Relay:** → enter `your-vps.example.com:7778`. Leave the
+   field empty at any time to switch back to direct P2P.
+
+3. **Send normally.** The ticket now encodes the relay's address instead
+   of yours (`bold-crab-fern-42@r:your-vps.example.com:7778`). Both peers
+   connect to the relay, which forwards opaque UDP datagrams between
+   them. The relay **cannot decrypt anything** — your AEAD keys are
+   derived from the ticket PSK and never leave either peer.
+
+CLI:
+```bash
+lentel send ./big.mkv --relay your-vps.example.com:7778
+# receiver:
+lentel recv bold-crab-fern-42@r:your-vps.example.com:7778
+```
+
+Relay mode works on **any** NAT type. The only downside is that the
+transfer speed is bounded by the relay's bandwidth instead of your direct
+link — still plenty fast for most files.
+
 ## Security
 
 | Layer | Primitive |

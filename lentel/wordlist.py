@@ -1,21 +1,21 @@
 """
-Ticket encoding with embedded sender address.
+Ticket encoding.
 
-A Lentel ticket now looks like:
+A Lentel ticket encodes either:
 
-    bold-crab-fern-42@203.0.113.5:54321
+  * a **direct** peer-to-peer address
+        bold-crab-fern-42@203.0.113.5:54321
 
-It has two parts separated by ``@``:
+  * or a **relay** address (for networks where NAT hole-punching fails)
+        bold-crab-fern-42@r:relay.example.com:7778
 
-  - **Code** ``bold-crab-fern-42``: three words from a 256-entry wordlist
-    plus a two-digit checksum.  The full code string is hashed into the
-    32-byte PSK used for the AEAD handshake.
-  - **Address** ``203.0.113.5:54321``: the sender's public IP and UDP port
-    discovered via STUN (or UPnP).  The receiver connects directly to this
-    address — no coordinator server is needed.
-
-For LAN-only transfers where both peers are on the same subnet, the address
-part can carry a private IP (``192.168.1.x``).
+Both forms begin with a three-word code + two-digit checksum.  The word
+code is hashed into the 32-byte PSK used for the AEAD handshake.  The
+``@`` delimiter separates the code from the address.  A leading ``r:``
+on the address marks relay mode — in that case the address is the relay's
+own endpoint, and both peers connect there.  The relay pairs peers by a
+token derived from the ticket's PSK; it forwards opaque UDP datagrams and
+never sees plaintext.
 """
 from __future__ import annotations
 
@@ -61,35 +61,40 @@ WORDLIST: tuple[str, ...] = (
 assert len(WORDLIST) == 256
 _INDEX = {w: i for i, w in enumerate(WORDLIST)}
 
+RELAY_MARKER = "r:"
+
 
 def _checksum(words: list[str]) -> int:
     data = "-".join(words).encode("utf-8")
     return int.from_bytes(hashlib.blake2b(data, digest_size=1).digest(), "big") % 100
 
 
-def new_ticket(addr: tuple[str, int], n_words: int = 3) -> str:
-    """Generate a ticket with an embedded sender address.
-
-    >>> new_ticket(("203.0.113.5", 54321))
-    'bold-crab-fern-42@203.0.113.5:54321'
-    """
+def new_code(n_words: int = 3) -> str:
+    """Generate just the word code (no address)."""
     if n_words < 2:
         raise ValueError("ticket needs at least 2 words")
-    words = [secrets.choice(WORDLIST) for _ in range(n_words)]
-    chk = _checksum(words)
-    code = "-".join(words) + f"-{chk:02d}"
-    return f"{code}@{addr[0]}:{addr[1]}"
-
-
-def new_code(n_words: int = 3) -> str:
-    """Generate just the code part (no address). For tests / pre-generation."""
     words = [secrets.choice(WORDLIST) for _ in range(n_words)]
     chk = _checksum(words)
     return "-".join(words) + f"-{chk:02d}"
 
 
-def parse_ticket(ticket: str) -> tuple[str, tuple[str, int]]:
-    """Validate and return (code, (ip, port)).
+def new_ticket(
+    addr: tuple[str, int],
+    via_relay: bool = False,
+    n_words: int = 3,
+) -> str:
+    """Generate a ticket with an embedded address.
+
+    ``addr`` is the direct sender address, or the relay address when
+    ``via_relay=True``.
+    """
+    code = new_code(n_words)
+    prefix = RELAY_MARKER if via_relay else ""
+    return f"{code}@{prefix}{addr[0]}:{addr[1]}"
+
+
+def parse_ticket(ticket: str) -> tuple[str, tuple[str, int], bool]:
+    """Validate and return (code, (ip_or_host, port), via_relay).
 
     Raises ValueError on bad format/checksum.
     """
@@ -100,6 +105,11 @@ def parse_ticket(ticket: str) -> tuple[str, tuple[str, int]]:
             "(e.g. bold-crab-fern-42@203.0.113.5:54321)"
         )
     code, addr_str = ticket.rsplit("@", 1)
+
+    via_relay = False
+    if addr_str.startswith(RELAY_MARKER):
+        via_relay = True
+        addr_str = addr_str[len(RELAY_MARKER):]
 
     # Validate code.
     parts = code.split("-")
@@ -117,8 +127,8 @@ def parse_ticket(ticket: str) -> tuple[str, tuple[str, int]]:
 
     # Validate address.
     if ":" not in addr_str:
-        raise ValueError("ticket address must be IP:PORT")
-    ip_str, port_str = addr_str.rsplit(":", 1)
+        raise ValueError("ticket address must be HOST:PORT")
+    host_str, port_str = addr_str.rsplit(":", 1)
     try:
         port = int(port_str)
     except ValueError:
@@ -126,4 +136,13 @@ def parse_ticket(ticket: str) -> tuple[str, tuple[str, int]]:
     if port < 1 or port > 65535:
         raise ValueError(f"port out of range: {port}")
 
-    return code, (ip_str, port)
+    return code, (host_str, port), via_relay
+
+
+def psk_to_relay_token(psk: bytes) -> bytes:
+    """Derive the 16-byte relay pairing token from the ticket PSK.
+
+    The relay uses this as an opaque key to match two peers.  Deriving it
+    from the PSK means the relay operator never sees the PSK itself.
+    """
+    return hashlib.blake2b(b"lentel/v1/relay-token\x00" + psk, digest_size=16).digest()

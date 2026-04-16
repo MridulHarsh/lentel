@@ -17,6 +17,10 @@ CONFIG_PATH = CONFIG_DIR / "config.json"
 class Config:
     parallel: int = 4
     download_dir: str = str(Path.home() / "Downloads")
+    # Optional relay URL (host:port). When set, sends go through this relay
+    # instead of direct P2P — needed when your NAT blocks incoming connections.
+    # The relay only forwards opaque UDP packets; it never sees plaintext.
+    relay_url: str = ""
 
 
 def load_config() -> Config:
@@ -93,6 +97,12 @@ class AppState:
     def set_parallel(self, n: int) -> None:
         with self._lock:
             self.config.parallel = max(1, min(16, int(n)))
+            save_config(self.config)
+        self.on_change()
+
+    def set_relay_url(self, url: str) -> None:
+        with self._lock:
+            self.config.relay_url = url.strip()
             save_config(self.config)
         self.on_change()
 
