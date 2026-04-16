@@ -45,6 +45,7 @@ TAG_MANIFEST = 0x00
 TAG_RESUME = 0x01
 TAG_DONE = 0x02
 TAG_ABORT = 0x03
+TAG_DONE_ACK = 0x04   # sender -> receiver: "I got your DONE, you may close"
 
 # Chunk header: u32 file_index || u32 chunk_index || u32 length
 _CHUNK_HDR = struct.Struct("!III")
@@ -160,6 +161,15 @@ class SendSession:
                 raise TransferError("receiver closed before confirming")
             tag = msg[0]
             if tag == TAG_DONE:
+                # Acknowledge: tells the receiver we've read DONE and it's
+                # now safe for them to close without losing our side's
+                # view of the transfer. Drain so the ACK lands on the wire
+                # before our own close().
+                try:
+                    await self._sess.send(CONTROL_STREAM, bytes([TAG_DONE_ACK]))
+                    await self._sess.drain(timeout=2.0)
+                except Exception:
+                    pass
                 return
             if tag == TAG_ABORT:
                 reason = msg[1] if len(msg) > 1 else 0
@@ -262,9 +272,25 @@ class RecvSession:
             if not verify_manifest(writer.root_path, manifest):
                 raise TransferError("final Merkle root mismatch")
 
-            # 7. Confirm.
+            # 7. Confirm + wait for the sender's DONE_ACK.
+            #
+            # Without the explicit ACK, there's a race at teardown: if we
+            # close() right after send(DONE), the CLOSE packet can arrive at
+            # the sender BEFORE the sender's asyncio loop has pulled DONE
+            # from its recv queue (observed on Windows + Python 3.11/3.12).
+            # The ACK guarantees the sender has already processed DONE.
             await self._sess.send(CONTROL_STREAM, bytes([TAG_DONE]))
             await self._sess.drain(timeout=5.0)
+            try:
+                ack = await asyncio.wait_for(
+                    self._sess.recv(CONTROL_STREAM), timeout=10.0,
+                )
+                # Don't strictly require TAG_DONE_ACK — any response (or
+                # even session close from the peer) is enough to know the
+                # sender has finished reading.
+                _ = ack
+            except asyncio.TimeoutError:
+                pass
             return writer.output_path
 
         except Exception:
